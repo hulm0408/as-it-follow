@@ -5757,6 +5757,7 @@ export async function syncGroupCartAndCheckoutForAccount(account, order, options
       return { fetchedAddrs, earlySaved, resolvedAddr };
     })();
 
+    const __t0 = Date.now();
     const [auth, eventsClaimRes, cartMeta, addrBundle, inspectedInitialCart] = await Promise.all([
       getSwiggySessionAuth(account, false),
       Promise.race([
@@ -5771,6 +5772,7 @@ export async function syncGroupCartAndCheckoutForAccount(account, order, options
     ]);
     const addrMeta = addrBundle.resolvedAddr;
     const savedAddresses = addrBundle.fetchedAddrs;
+    console.log(`[perf] sync wave1 (auth+address+cart read) took ${Date.now() - __t0}ms`);
 
     if (auth?.sessionExpired) {
       return {
@@ -6253,8 +6255,12 @@ export async function syncGroupCartAndCheckoutForAccount(account, order, options
 
     // Priority 5: Universal fallback codes
     // Always include top high-discount promo codes (SNACKIT, TRYNEW, STEALDEAL, SWIGGYIT, WELCOME50) so eligible discounts are always tested!
-    for (const std of ['SNACKIT', 'TRYNEW', 'STEALDEAL', 'SWIGGYIT', 'WELCOME50']) {
-      pushCoupon(std, std, 'Swiggy Promo Offer', 35);
+    // SPEED: only blind-probe universal codes when live discovery found nothing (each blind probe = 1 sequential server roundtrip)
+    const discoveredLiveCount = availableCoupons.filter(c => c.priority < 35).length;
+    if (discoveredLiveCount < 2) {
+      for (const std of ['SNACKIT', 'TRYNEW', 'STEALDEAL', 'SWIGGYIT', 'WELCOME50']) {
+        pushCoupon(std, std, 'Swiggy Promo Offer', 35);
+      }
     }
 
     availableCoupons.sort((a, b) => (a.priority || 50) - (b.priority || 50));
@@ -6281,13 +6287,19 @@ export async function syncGroupCartAndCheckoutForAccount(account, order, options
       // Probe all live candidates, excluding MCP-marked ineligible codes unless they were explicitly requested or already active.
       const explicitlySelectedCodes = new Set([order.couponCode, bestCode].filter(Boolean).map(code => String(code).trim().toUpperCase()));
       const couponsToTest = availableCoupons.filter(c => !mcpIneligibleCodes.has(c.code) || explicitlySelectedCodes.has(c.code));
+      // SPEED: coupon trials mutate one server cart so they must be sequential; bound them by count + time budget.
+      const trialDeadline = Date.now() + 3500;
+      const __trialStart = Date.now();
+      let trialCount = 0;
       for (const cand of couponsToTest) {
         if (cand.code === bestCode && bestCartState.discountAmount > 0) {
           validVerifiedCoupons.push({ ...cand, discountAmount: bestCartState.discountAmount, finalPayable: bestCartState.finalPayable });
           continue;
         }
+        if (trialCount >= 6 || Date.now() > trialDeadline) break;
+        trialCount++;
         appliedAnyTrial = true;
-        const tested = await applyLiveCouponToOrder(account, order, cand.code, { fastSingleEngine: (cand.priority || 50) >= 35 });
+        const tested = await applyLiveCouponToOrder(account, order, cand.code, { fastSingleEngine: true });
         if (tested && tested.items?.length > 0) {
           lastLiveCartState = tested;
           if (tested.couponCode === cand.code && tested.discountAmount > 0) {
@@ -6305,6 +6317,7 @@ export async function syncGroupCartAndCheckoutForAccount(account, order, options
         }
       }
 
+      console.log(`[perf] coupon trials: ${trialCount} tested in ${Date.now() - __trialStart}ms, best=${bestCode || 'none'}, verified=${validVerifiedCoupons.length}`);
       validVerifiedCoupons.sort((a, b) => {
         const payA = Number.isFinite(Number(a.finalPayable)) ? Number(a.finalPayable) : Number.POSITIVE_INFINITY;
         const payB = Number.isFinite(Number(b.finalPayable)) ? Number(b.finalPayable) : Number.POSITIVE_INFINITY;
