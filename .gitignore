@@ -72,3 +72,6 @@ extract_frames.py
 extracted_mp4_frames/
 
 
+
+temp-clone/
+test_chat_mockup_flow.mjs
