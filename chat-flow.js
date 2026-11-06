@@ -29,6 +29,7 @@
 import QRCode from 'qrcode';
 import { extractSharedUrls, normalizeSharedUrl } from './link-utils.js';
 import { analyzeJsonAccountOrders, formatOrderHistoryMonospace } from './json-analyzer.js';
+import { saveToLocalStorage, getLocalStorageStats } from './local-storage-manager.js';
 import {
   parseAddressDetails,
   parseCartDetails,
@@ -214,6 +215,20 @@ export function setupChatFlow(bot) {
   bot.command('scan', sendScanInstructions);
   bot.command('analyze', sendScanInstructions);
 
+  bot.command('storage', async (ctx) => {
+    const stats = getLocalStorageStats();
+    const msg =
+      `<pre><code>💾 LOCAL STORAGE SUMMARY\n` +
+      `----------------------------------\n` +
+      `TOTAL FILES SCANNED : ${stats.totalFiles}\n` +
+      `WITH ORDERS         : ${stats.withOrders}\n` +
+      `ZERO ORDERS         : ${stats.zeroOrders}\n` +
+      `TOTAL ORDERS FOUND  : ${stats.totalOrders}\n` +
+      `----------------------------------\n` +
+      `PATH: data/local_storage/</code></pre>`;
+    await ctx.reply(msg, { parse_mode: 'HTML' });
+  });
+
   // Document upload handler: analyzes JSON account files in bulk
   bot.on('document', async (ctx) => {
     const doc = ctx.message?.document;
@@ -247,6 +262,9 @@ export function setupChatFlow(bot) {
       }
 
       const analysis = await analyzeJsonAccountOrders(parsed, text);
+
+      // Persist raw file & analysis results to local storage immediately
+      saveToLocalStorage(fileName, text, analysis);
 
       // Delete the analyzing status message
       await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
