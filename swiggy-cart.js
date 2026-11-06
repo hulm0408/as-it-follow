@@ -7592,6 +7592,7 @@ export async function generateRealSwiggyMerchantUpiQr(accountOrOpts, maybeOrder)
     // AND `+₹1` Swiggy One Lite Free Delivery directly inside the real `upi://pay?pa=upiswiggy@icici` QR!
     const sendNativeAndroidPlaceOrder = async (splitPayAmt) => {
       let latestTid = curCart?.json?.tid || account.jwtTid || auth.jwtTid || '';
+      const netPayAmt = splitPayAmt > 0 ? Math.max(1, Math.round((Number(cm.order_total || 0) - Number(splitPayAmt || 0)) * 100) / 100) : Number(cm.order_total || 0);
       const buildNativeReq = () => ({
         headers: buildSwiggyAndroidClientHeaders(account, {
           tid: latestTid,
@@ -7602,7 +7603,7 @@ export async function generateRealSwiggyMerchantUpiQr(accountOrOpts, maybeOrder)
           lat,
           lng,
           extraHeaders: {
-            paymentamount: String(cm.order_total),
+            paymentamount: String(netPayAmt),
             cartid: String(cm.cartId || cartId),
             cartaddressid: String(addressId),
             addressid: String(addressId),
@@ -7647,9 +7648,9 @@ export async function generateRealSwiggyMerchantUpiQr(accountOrOpts, maybeOrder)
           cart_total_shown_to_coupon: cm.cart_total_shown_to_coupon ?? cm.order_total,
           total_without_coupon_discount: cm.total_without_coupon_discount ?? cm.order_total,
           original_order_total: cm.original_order_total ?? cm.order_total,
-          transaction_amount: cm.order_total,
-          updated_amount: cm.order_total,
-          amount: cm.order_total,
+          transaction_amount: netPayAmt,
+          updated_amount: netPayAmt,
+          amount: netPayAmt,
           cartId: cm.cartId || cartId,
           cart_id: cm.cartId || cartId,
           originalCartId: cm.originalCartId || cartId,
