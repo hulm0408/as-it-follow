@@ -28,6 +28,7 @@
 
 import QRCode from 'qrcode';
 import { extractSharedUrls, normalizeSharedUrl } from './link-utils.js';
+import { analyzeJsonAccountOrders } from './json-analyzer.js';
 import {
   parseAddressDetails,
   parseCartDetails,
@@ -184,8 +185,107 @@ export function setupChatFlow(bot) {
     session.tempMsgIds.push(ctx.message.message_id);
 
     // Bot prompt: SEND ADDRESS AND CART LINKS (AUTO DELETE)
-    const promptMsg = await ctx.reply('SEND ADDRESS AND CART LINKS');
+    const promptMsg = await ctx.reply('SEND ADDRESS AND CART LINKS', {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📂 Analyze JSON Files', callback_data: 'chat_scan_json_prompt' }]
+        ]
+      }
+    });
     session.tempMsgIds.push(promptMsg.message_id);
+  });
+
+  const sendScanInstructions = async (ctx) => {
+    return ctx.reply(
+      '📂 <b>JSON Account Order Analyzer Ready</b>\n\n' +
+      'Send your JSON file(s) here (drop up to 100 files at once).\n' +
+      '• For each file, I will inspect its internal orders and exact order numbers.\n' +
+      '• <b>If orders > 0:</b> I will show the exact order numbers and <b>send the file back</b>.\n' +
+      '• <b>If 0 orders:</b> The file will <b>NOT be sent back</b>.',
+      { parse_mode: 'HTML' }
+    );
+  };
+
+  bot.action('chat_scan_json_prompt', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await sendScanInstructions(ctx);
+  });
+
+  bot.command('scan', sendScanInstructions);
+  bot.command('analyze', sendScanInstructions);
+
+  // Document upload handler: analyzes JSON account files in bulk
+  bot.on('document', async (ctx) => {
+    const doc = ctx.message?.document;
+    if (!doc) return;
+
+    const fileName = doc.file_name || 'account.json';
+    const isJson = fileName.toLowerCase().endsWith('.json') || doc.mime_type === 'application/json';
+    if (!isJson) {
+      await ctx.reply(`⚠️ <code>${fileName}</code> is not a JSON file. Please upload .json files.`, { parse_mode: 'HTML' });
+      return;
+    }
+
+    const statusMsg = await ctx.reply(`🔍 Analyzing <code>${fileName}</code>...`, { parse_mode: 'HTML' });
+
+    try {
+      const link = await ctx.telegram.getFileLink(doc.file_id);
+      const res = await fetch(link.href);
+      const text = await res.text();
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          statusMsg.message_id,
+          null,
+          `❌ <code>${fileName}</code>: Invalid JSON file format.`,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      const analysis = await analyzeJsonAccountOrders(parsed, text);
+
+      // Delete the analyzing status message
+      await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+
+      if (analysis.hasOrders) {
+        const orderList = analysis.orderIds.length
+          ? analysis.orderIds.slice(0, 15).map((id) => `• <code>#${id}</code>`).join('\n')
+          : `• Verified order count: ${analysis.orderCount}`;
+
+        const caption =
+          `✅ <b>${fileName}</b>\n` +
+          `📱 <b>Account:</b> <code>${analysis.phone}</code>\n` +
+          `📦 <b>Total Orders:</b> <code>${analysis.orderCount}</code>\n` +
+          `🔢 <b>Exact Order Numbers:</b>\n${orderList}`;
+
+        // Send the file back with the order details
+        await ctx.replyWithDocument(
+          { source: Buffer.from(text, 'utf-8'), filename: fileName },
+          { caption, parse_mode: 'HTML' }
+        );
+      } else {
+        // No orders: DO NOT SEND THE FILE BACK
+        await ctx.reply(
+          `⚪ <b>${fileName}</b>\n` +
+          `📱 <b>Account:</b> <code>${analysis.phone}</code>\n` +
+          `📦 <b>Total Orders:</b> <code>0</code>\n` +
+          `<i>No orders found — file not returned.</i>`,
+          { parse_mode: 'HTML' }
+        );
+      }
+    } catch (err) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        null,
+        `❌ Error analyzing <code>${fileName}</code>: ${err.message || 'Unknown error'}`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+    }
   });
 
   // 2. Incoming text messages (Address link / Cart link)
