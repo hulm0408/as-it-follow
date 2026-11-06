@@ -2,12 +2,12 @@
 // TOING SWIGGY TELEGRAM BOT (REAL SWIGGY API ORDERING ENGINE)
 // ----------------------------------------------------------------------------
 // - 100% Monospace UI (<pre><code>) on all bot responses
-// - Real Swiggy API Restaurant Search at user's delivery location
+// - Real Swiggy API Restaurant Search at user's delivery location (Open Outlets Only)
 // - Real Swiggy Outlets selector (short callback data under 64 bytes)
 // - Real Swiggy Menu dishes & EXACT live prices (no mock/dummy markups)
 // - Real Swiggy Login with JSON / Token & Logout
-// - Real Swiggy ₹50 Refer Cash / Swiggy Money Opt-in & Claim
-// - Real Swiggy Live Bill Calculation (Direct DAPI Cart Sync)
+// - Real Swiggy Money / Wallet Free Cash Inspection (Zero Fake Claim)
+// - Real Swiggy Detailed Live Bill (Item total, Packing, Taxes, Delivery, Discounts, Final Pay)
 // - Real Swiggy Merchant UPI QR via generateRealSwiggyMerchantUpiQr (bypassBillMatch: true)
 // - Zero fake dummy fallbacks
 // ============================================================================
@@ -20,6 +20,7 @@ import {
   fetchFastRestaurantInfo,
   claimInstamartFreeCash,
   generateRealSwiggyMerchantUpiQr,
+  saveAddressToAccount,
   swiggyCartUpdate,
   parseDapiCartPayload,
   buildSwiggyCartItemsPayload,
@@ -67,7 +68,7 @@ function mono(text) {
 export function formatDashboard(s) {
   const acc = s.account ? (s.account.phone ? maskPhoneStars(s.account.phone) : 'LOGGED IN') : 'NO ACCOUNT';
   const addr = s.address ? (s.address.name || s.address.address ? `${String(s.address.address || '').slice(0, 22)}...` : 'SET') : 'NOT SET';
-  const cash = s.referClaimed ? `₹${s.freeCashAmount || 50} ACTIVE` : 'UNCLAIMED';
+  const cash = s.freeCashAmount > 0 ? `₹${s.freeCashAmount} ACTIVE` : '₹0';
   const itemsCount = s.cart.reduce((sum, it) => sum + (it.qty || 1), 0);
 
   const lines = [
@@ -75,7 +76,7 @@ export function formatDashboard(s) {
     '----------------------',
     `ACCOUNT : ${acc}`,
     `ADDRESS : ${addr}`,
-    `REFER   : ${cash}`,
+    `WALLET  : ${cash}`,
     `CART    : ${itemsCount} ITEMS`,
     '----------------------'
   ];
@@ -91,7 +92,7 @@ export function getMainMenuKeyboard(s) {
           isLogged
             ? { text: '🚪 LOGOUT', callback_data: 'tb_logout' }
             : { text: '🔑 LOGIN', callback_data: 'tb_login_prompt' },
-          { text: '🎁 CLAIM ₹50', callback_data: 'tb_claim_offer' }
+          { text: '🎁 SWIGGY CASH', callback_data: 'tb_claim_offer' }
         ],
         [
           { text: '📍 ADDRESS', callback_data: 'tb_addr_prompt' },
@@ -106,17 +107,17 @@ export function getMainMenuKeyboard(s) {
 }
 
 /**
- * Pure-HTTP fast claim for Swiggy Referral Free Cash & Swiggy Money Opt-in.
+ * Pure-HTTP fast claim for Swiggy Referral Free Cash & Swiggy Money inspection.
  */
 async function claimSwiggyCash(account) {
-  if (!account) return { success: false, message: 'NO ACCOUNT LOGGED IN' };
+  if (!account) return { success: false, balance: 0, message: 'NO ACCOUNT LOGGED IN' };
   try {
     // 1. Trigger Swiggy Money Opt-in and Reward Claim endpoints
     await dapiFetch(account, 'user/swiggy-money/opt-in', { method: 'POST', body: {} }).catch(() => {});
     await dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'instamart_free_cash' } }).catch(() => {});
     await dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'referral_free_cash' } }).catch(() => {});
 
-    // 2. Fetch live cart to verify active Swiggy Money / Wallet Free Cash balance
+    // 2. Fetch live cart to inspect real Swiggy Money / Wallet Free Cash balance
     const cartRes = await dapiFetch(account, 'cart', { timeoutMs: 7000 }).catch(() => null);
     const cm = cartRes?.json?.data?.cartMeta || cartRes?.json?.data || {};
     const walletBalance = Number(cm.user_swiggy_money || cm.swiggy_money || cm.user_swiggy_money_balance || cm.swiggy_pay_eligible_balance || 0);
@@ -126,15 +127,16 @@ async function claimSwiggyCash(account) {
       balance: walletBalance,
       message: walletBalance > 0
         ? `₹${walletBalance} ACTIVE IN WALLET`
-        : 'CLAIM PROCESSED (APPLIES AT CHECKOUT)'
+        : '₹0 (NO PROMO BALANCE ON THIS ACCOUNT)'
     };
   } catch (err) {
-    return { success: false, message: err.message };
+    return { success: false, balance: 0, message: err.message };
   }
 }
 
 /**
  * Searches real Swiggy restaurants from live API at given location.
+ * Prioritizes OPEN outlets and flags closed outlets.
  */
 export async function searchRealRestaurants(query, lat = '26.8658609', lng = '80.9307755', account = null) {
   try {
@@ -144,10 +146,12 @@ export async function searchRealRestaurants(query, lat = '26.8658609', lng = '80
       if (!n || typeof n !== 'object') return;
       if (n.info && n.info.id && n.info.name && !seen.has(String(n.info.id))) {
         seen.add(String(n.info.id));
+        const isOpen = n.info.isOpen !== false && n.info.availability?.opened !== false;
         allRests.push({
           id: String(n.info.id),
           name: String(n.info.name).trim(),
-          area: String(n.info.areaName || n.info.locality || '').trim()
+          area: String(n.info.areaName || n.info.locality || '').trim(),
+          isOpen
         });
       }
       if (Array.isArray(n)) n.forEach(walk);
@@ -172,6 +176,9 @@ export async function searchRealRestaurants(query, lat = '26.8658609', lng = '80
     const matched = allRests.filter(
       (r) => r.name.toLowerCase().includes(q) || q.includes(r.name.toLowerCase())
     );
+
+    // Sort: Open outlets first!
+    matched.sort((a, b) => (b.isOpen ? 1 : 0) - (a.isOpen ? 1 : 0));
 
     return { allRests, matched };
   } catch (err) {
@@ -244,7 +251,7 @@ export function setupToingBot(bot) {
     );
   });
 
-  // 4. Claim ₹50 Refer Cash (Real Swiggy API Claim)
+  // 4. Claim / Inspect Swiggy Free Cash (Real Swiggy API Inspection)
   bot.action('tb_claim_offer', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const s = getState(ctx.from.id);
@@ -257,20 +264,26 @@ export function setupToingBot(bot) {
       return;
     }
 
-    const waitMsg = await ctx.reply(mono('CONNECTING TO SWIGGY & CLAIMING ₹50 REFER CASH...'), { parse_mode: 'HTML' });
+    const waitMsg = await ctx.reply(mono('CONNECTING TO SWIGGY & CHECKING WALLET CASH...'), { parse_mode: 'HTML' });
     const claimRes = await claimSwiggyCash(s.account);
     await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
 
-    s.referClaimed = true;
-    s.freeCashAmount = claimRes.balance || 50;
+    s.referClaimed = Boolean(claimRes.balance > 0);
+    s.freeCashAmount = claimRes.balance || 0;
 
     const lines = [
-      'OFFER CLAIM RESULT',
+      'SWIGGY WALLET STATUS',
       '----------------------',
-      `STATUS  : ${claimRes.message}`,
-      'DETAILS : AUTO-APPLIED BY SWIGGY',
+      `BALANCE : ₹${claimRes.balance}`,
+      `STATUS  : ${claimRes.balance > 0 ? 'ACTIVE IN WALLET' : 'NO FREE CASH ON ACCOUNT'}`,
       '----------------------'
     ];
+    if (claimRes.balance > 0) {
+      lines.push('SWIGGY WILL AUTO-APPLY THIS CASH');
+      lines.push('AT CHECKOUT IN YOUR REAL ORDER!');
+    } else {
+      lines.push('THIS ACCOUNT HAS NO PROMOTIONAL FREE CASH.');
+    }
 
     await ctx.reply(mono(lines.join('\n')), {
       parse_mode: 'HTML',
@@ -310,7 +323,7 @@ export function setupToingBot(bot) {
     );
   });
 
-  // 7. Bill & QR (Fetches Genuine Swiggy Live Bill)
+  // 7. Bill & QR (Fetches Detailed Genuine Swiggy Live Bill)
   bot.action('tb_bill_qr', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const s = getState(ctx.from.id);
@@ -333,8 +346,19 @@ export function setupToingBot(bot) {
 
     // Direct Live Cart Sync with Swiggy API
     if (s.account && s.address && s.lat && s.lng) {
-      const waitMsg = await ctx.reply(mono('CALCULATING LIVE SWIGGY BILL...'), { parse_mode: 'HTML' });
+      const waitMsg = await ctx.reply(mono('CONNECTING TO SWIGGY & FETCHING OFFICIAL BILL...'), { parse_mode: 'HTML' });
       try {
+        // Ensure address is saved and bound to this account on Swiggy
+        if (!s.address.id) {
+          const savedRes = await saveAddressToAccount(s.account, s.address);
+          if (savedRes?.addressId) {
+            s.address.id = savedRes.addressId;
+            if (savedRes.addressDetails) {
+              s.address = { ...s.address, ...savedRes.addressDetails, id: savedRes.addressId };
+            }
+          }
+        }
+
         const syncRes = await swiggyCartUpdate(
           s.account,
           {
@@ -348,6 +372,16 @@ export function setupToingBot(bot) {
         );
         await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
 
+        // Check if Swiggy returned restaurant closed error
+        const statusMsg = syncRes?.json?.statusMessage || '';
+        if (syncRes?.json?.statusCode === 1 && /closed|not accepting/i.test(statusMsg)) {
+          await ctx.reply(
+            mono(`RESTAURANT IS CLOSED\n----------------------\n${s.restaurant.name.toUpperCase()} IS CURRENTLY CLOSED.\nSWIGGY MESSAGE: "${statusMsg}"\n----------------------\nPLEASE SELECT AN OPEN RESTAURANT!`),
+            { parse_mode: 'HTML', ...getMainMenuKeyboard(s) }
+          );
+          return;
+        }
+
         const liveCart = syncRes?.json?.data ? parseDapiCartPayload(syncRes.json.data) : null;
         if (liveCart && (liveCart.finalPayable !== undefined || liveCart.orderTotal !== undefined)) {
           s.liveCart = liveCart;
@@ -357,7 +391,7 @@ export function setupToingBot(bot) {
           const lines = [
             'SWIGGY OFFICIAL LIVE BILL',
             '----------------------',
-            `RESTAURANT: ${s.restaurant.name}`,
+            `RESTAURANT : ${s.restaurant.name}`,
             '----------------------'
           ];
 
@@ -368,13 +402,14 @@ export function setupToingBot(bot) {
 
           lines.push('----------------------');
           lines.push(`ITEM TOTAL : ₹${liveCart.itemTotal}`);
-          if (liveCart.tradeDiscountTotal > 0) lines.push(`DISCOUNT   : -₹${liveCart.tradeDiscountTotal}`);
-          if (liveCart.couponDiscount > 0) lines.push(`COUPON OFF : -₹${liveCart.couponDiscount}`);
-          if (liveCart.walletSplitPayAmount > 0) lines.push(`FREE CASH  : -₹${liveCart.walletSplitPayAmount}`);
+          if (Number(liveCart.packingCharges || 0) > 0) lines.push(`PACKING    : ₹${liveCart.packingCharges}`);
+          if (Number(liveCart.taxesAndCharges || 0) > 0) lines.push(`TAXES/FEES : ₹${liveCart.taxesAndCharges}`);
           lines.push(`DELIVERY   : ${liveCart.deliveryFee <= 0 ? 'FREE' : '₹' + liveCart.deliveryFee}`);
-          if (liveCart.taxesAndCharges > 0) lines.push(`TAXES/FEES : ₹${liveCart.taxesAndCharges}`);
+          if (Number(liveCart.tradeDiscountTotal || 0) > 0) lines.push(`DISCOUNT   : -₹${liveCart.tradeDiscountTotal}`);
+          if (Number(liveCart.couponDiscount || 0) > 0) lines.push(`COUPON OFF : -₹${liveCart.couponDiscount}`);
+          if (Number(liveCart.walletSplitPayAmount || 0) > 0) lines.push(`FREE CASH  : -₹${liveCart.walletSplitPayAmount}`);
           lines.push('----------------------');
-          lines.push(`TO PAY     : ₹${toPay}`);
+          lines.push(`FINAL PAY  : ₹${toPay}`);
 
           await ctx.reply(mono(lines.join('\n')), {
             parse_mode: 'HTML',
@@ -633,6 +668,14 @@ export function setupToingBot(bot) {
       return;
     }
 
+    if (chosen.isOpen === false) {
+      await ctx.reply(
+        mono(`OUTLET CURRENTLY CLOSED\n----------------------\n${chosen.name.toUpperCase()} IS CLOSED RIGHT NOW.\nPLEASE SELECT AN OPEN OUTLET TO ORDER!\n----------------------`),
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
     s.restaurant = { id: String(chosen.id), name: chosen.name, area: chosen.area };
     s.step = 'AWAITING_ITEM_NAME';
 
@@ -845,6 +888,13 @@ export function setupToingBot(bot) {
             }
             s.step = 'IDLE';
 
+            // If account is logged in, bind address to account now
+            if (s.account && s.account.isLoggedIn) {
+              saveAddressToAccount(s.account, s.address).then((res) => {
+                if (res?.addressId) s.address.id = res.addressId;
+              }).catch(() => {});
+            }
+
             const lines = [
               'ADDRESS SET (SWIGGY VERIFIED)',
               '----------------------',
@@ -889,6 +939,12 @@ export function setupToingBot(bot) {
           s.lng = String(parsedAddr.lng);
         }
         s.step = 'IDLE';
+
+        if (s.account && s.account.isLoggedIn) {
+          saveAddressToAccount(s.account, s.address).then((res) => {
+            if (res?.addressId) s.address.id = res.addressId;
+          }).catch(() => {});
+        }
 
         const lines = [
           'ADDRESS SET (MANUAL)',
@@ -965,7 +1021,7 @@ export function setupToingBot(bot) {
         s.step = 'AWAITING_OUTLET_CHOICE';
         const buttons = s.pendingOutlets.map((r, i) => [
           {
-            text: `${r.name.slice(0, 20)} (${(r.area || 'Outlet').slice(0, 10)})`,
+            text: `${r.name.slice(0, 18)} (${(r.area || 'Main').slice(0, 8)})${r.isOpen ? '' : ' [CLOSED]'}`,
             callback_data: `tb_outlet_${i}`
           }
         ]);
@@ -982,6 +1038,14 @@ export function setupToingBot(bot) {
 
       // Single outlet matched
       const chosen = matched[0];
+      if (chosen.isOpen === false) {
+        await ctx.reply(
+          mono(`OUTLET CURRENTLY CLOSED\n----------------------\n${chosen.name.toUpperCase()} IS CLOSED RIGHT NOW.\nPLEASE SEARCH FOR AN OPEN RESTAURANT!`),
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
       s.restaurant = { id: chosen.id, name: chosen.name, area: chosen.area };
       s.step = 'AWAITING_ITEM_NAME';
 
