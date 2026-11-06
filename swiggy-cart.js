@@ -2918,7 +2918,7 @@ async function followShortChain(startUrl, userAgent) {
 }
 
 // Fast-resolve Swiggy links (Group Cart, Restaurant Menu, Shared Address, Google Maps, or Full Text)
-export async function resolveSwiggyLink(input) {
+export async function resolveSwiggyLink(input, accountOrCookies = null) {
   if (!input) return { url: input, type: 'UNKNOWN' };
   const rawInput = String(input).trim();
 
@@ -3077,7 +3077,7 @@ export async function resolveSwiggyLink(input) {
       const tokenIsUnexpandedShortId = Boolean(onelinkAddrMatch && ofoToken === onelinkAddrMatch[1]);
       // Still worth one attempt (some shares do carry a usable id), but a failure
       // here can never be reported as "expired": we never saw the real token.
-      const socialAddr = await resolveSharedOfoAddress(ofoToken, ofoUser);
+      const socialAddr = await resolveSharedOfoAddress(ofoToken, ofoUser, accountOrCookies);
       if (tokenIsUnexpandedShortId) {
         noteOfoFailure(ofoToken, 'UNEXPANDED');
         noteOfoFailure(primaryUrl, 'UNEXPANDED');

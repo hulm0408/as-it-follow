@@ -102,7 +102,6 @@ export function getMainMenuKeyboard(s) {
  */
 export async function searchRealRestaurants(query, lat = '26.8658609', lng = '80.9307755', account = null) {
   try {
-    const res = await dapiFetch(account, `restaurants/list/v5?lat=${lat}&lng=${lng}`, { timeoutMs: 9000 });
     const allRests = [];
     const seen = new Set();
     const walk = (n) => {
@@ -118,7 +117,16 @@ export async function searchRealRestaurants(query, lat = '26.8658609', lng = '80
       if (Array.isArray(n)) n.forEach(walk);
       else Object.values(n).forEach(walk);
     };
-    walk(res?.json?.data);
+
+    // 1. Try dedicated live search endpoint (accurate city-wide matching)
+    const searchRes = await dapiFetch(account, `restaurants/search/v3?lat=${lat}&lng=${lng}&str=${encodeURIComponent(query)}&trackingId=undefined&submitAction=ENTER`, { timeoutMs: 9000 });
+    walk(searchRes?.json?.data);
+
+    // 2. Fall back to home feed list if search returned no direct outlet matches
+    if (allRests.length === 0) {
+      const listRes = await dapiFetch(account, `restaurants/list/v5?lat=${lat}&lng=${lng}`, { timeoutMs: 9000 });
+      walk(listRes?.json?.data);
+    }
 
     const q = query.toLowerCase().trim();
     // Substring or word match
@@ -621,46 +629,105 @@ export function setupToingBot(bot) {
       } catch (_) {}
     }
 
-    // Case B: Awaiting Address Link
-    if (s.step === 'AWAITING_ADDRESS_LINK' || text.includes('swiggy.com/ofo/address') || text.includes('onelink.me')) {
+    // Case B: Awaiting Address Link or Text Address
+    if (s.step === 'AWAITING_ADDRESS_LINK' || text.includes('swiggy.com/ofo/address') || text.includes('onelink.me') || text.includes('swig.gy')) {
       const urls = extractSharedUrls(text);
-      const addrUrl = urls[0] || normalizeSharedUrl(text) || text;
-      s.addressLink = addrUrl;
+      const addrUrl = urls[0] || (text.startsWith('http') ? text : null);
 
-      try {
-        const resolved = await resolveSwiggyLink(addrUrl).catch(() => null);
-        const parsedAddr = parseAddressDetails(text, { allowWithUrl: true }) || {
-          name: 'Customer',
-          mobile: '9823305540',
-          address: 'Flat 412, 4th Floor'
-        };
+      if (addrUrl) {
+        s.addressLink = addrUrl;
+        const statusMsg = await ctx.reply(mono('FETCHING ADDRESS FROM SWIGGY...'), { parse_mode: 'HTML' });
 
-        s.address = parsedAddr;
-        if (resolved?.lat && resolved?.lng) {
-          s.lat = String(resolved.lat);
-          s.lng = String(resolved.lng);
+        try {
+          const resolved = await resolveSwiggyLink(addrUrl, s.account || null);
+          await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+
+          const addr = resolved?.addressDetails;
+          const isUsable = addr && !addr.unresolvableShortLink && addr.address && addr.address.length >= 5;
+
+          if (isUsable) {
+            s.address = {
+              name: addr.name || 'Customer',
+              mobile: addr.mobile || '',
+              address: addr.address,
+              flat_no: addr.flat_no || '',
+              area: addr.area || '',
+              landmark: addr.landmark || '',
+              city: addr.city || 'Delivery Location',
+              lat: addr.lat,
+              lng: addr.lng
+            };
+            if (addr.lat && addr.lng) {
+              s.lat = String(addr.lat);
+              s.lng = String(addr.lng);
+            }
+            s.step = 'IDLE';
+
+            const lines = [
+              'ADDRESS SET (SWIGGY VERIFIED)',
+              '----------------------',
+              `NAME  : ${s.address.name || 'Not Provided'}`,
+              `PHONE : ${s.address.mobile || 'Not Provided'}`,
+              `LOC   : ${s.address.address}`,
+              '----------------------'
+            ];
+            await ctx.reply(mono(lines.join('\n')), {
+              parse_mode: 'HTML',
+              ...getMainMenuKeyboard(s)
+            });
+            return;
+          } else {
+            // Address could NOT be resolved from Swiggy link
+            s.address = null;
+            const errLines = [
+              'COULD NOT FETCH ADDRESS',
+              '----------------------',
+              'SWIGGY LINK IS INVALID OR EXPIRED.',
+              'PLEASE SEND A FRESH SWIGGY ADDRESS LINK',
+              'OR SEND MANUAL ADDRESS FORMAT:',
+              'NAME, 10-DIGIT MOBILE, FULL ADDRESS',
+              '----------------------'
+            ];
+            await ctx.reply(mono(errLines.join('\n')), { parse_mode: 'HTML' });
+            return;
+          }
+        } catch (err) {
+          await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+          s.address = null;
+          await ctx.reply(mono(`ADDRESS FETCH FAILED: ${err.message}`), { parse_mode: 'HTML' });
+          return;
         }
-      } catch (_) {
-        s.address = {
-          name: 'Customer',
-          mobile: '9823305540',
-          address: 'Delivery Location'
-        };
       }
 
-      s.step = 'IDLE';
-      const lines = [
-        'ADDRESS SET SUCCESSFUL',
-        '----------------------',
-        `NAME  : ${s.address.name || 'Customer'}`,
-        `PHONE : ${s.address.mobile || '9823305540'}`,
-        `LOC   : ${s.address.address || 'Delivery Location'}`,
-        '----------------------'
-      ];
-      await ctx.reply(mono(lines.join('\n')), {
-        parse_mode: 'HTML',
-        ...getMainMenuKeyboard(s)
-      });
+      // If user typed manual text without URL
+      const parsedAddr = parseAddressDetails(text, { allowWithUrl: false });
+      if (parsedAddr && parsedAddr.address && parsedAddr.mobile) {
+        s.address = parsedAddr;
+        if (parsedAddr.lat && parsedAddr.lng) {
+          s.lat = String(parsedAddr.lat);
+          s.lng = String(parsedAddr.lng);
+        }
+        s.step = 'IDLE';
+
+        const lines = [
+          'ADDRESS SET (MANUAL)',
+          '----------------------',
+          `NAME  : ${s.address.name || 'Customer'}`,
+          `PHONE : ${s.address.mobile}`,
+          `LOC   : ${s.address.address}`,
+          '----------------------'
+        ];
+        await ctx.reply(mono(lines.join('\n')), {
+          parse_mode: 'HTML',
+          ...getMainMenuKeyboard(s)
+        });
+        return;
+      }
+
+      await ctx.reply(
+        mono('INVALID ADDRESS FORMAT\nPLEASE SEND A VALID SWIGGY LINK\nOR: NAME, MOBILE, ADDRESS'),
+        { parse_mode: 'HTML' }
+      );
       return;
     }
 
