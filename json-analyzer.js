@@ -1,21 +1,93 @@
 // ============================================================================
-// JSON ACCOUNT ORDER ANALYZER
+// JSON ACCOUNT ORDER ANALYZER (WITH INCOGNITO & MULTI-DELIVERY SUPPORT)
 // ----------------------------------------------------------------------------
 // Analyzes uploaded Swiggy JSON accounts/sessions:
-// - Extracts internal orders & order numbers (both from JSON and live Swiggy API)
-// - Determines exact order count and specific order IDs
-// - IF orders > 0: sends order summary AND sends the file back
-// - IF orders === 0: DOES NOT send the file back (per boss/user requirement)
+// - Deep-scans embedded JSON trees for order traces (incognito dumps,
+//   active orders, checkout session state, order history).
+// - Probes live Swiggy APIs across all channels in parallel:
+//   * Regular Food (/order/all)
+//   * Instamart (/order/all?deliveryType=INSTAMART)
+//   * Genie (/order/all?deliveryType=GENIE)
+//   * Dineout (/order/all?deliveryType=DINEOUT)
+//   * User Profile (/profile/info)
+// - Validates order status: keeps placed, in-progress, and delivered orders.
+// - IF orders > 0: shows exact order count & order IDs, and sends the file back.
+// - IF orders === 0: DOES NOT send the file back (per boss/user requirement).
 // ============================================================================
 
 import { normalizeSwiggySessionPayload } from './store.js';
 import { dapiFetch } from './swiggy-cart.js';
 
 /**
+ * Deep recursive search for any order ID stored in the JSON tree,
+ * including incognito localStorage dumps, active orders, or checkout states.
+ */
+function findOrderIdsDeep(obj, seen = new Set(), orderIds = []) {
+  if (!obj || typeof obj !== 'object') return orderIds;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      findOrderIdsDeep(item, seen, orderIds);
+    }
+    return orderIds;
+  }
+
+  // Check parent status if present
+  const parentStatus = String(obj.order_status || obj.status || obj.post_status || '').toLowerCase();
+  const isFailed = /failed|cancelled|canceled/.test(parentStatus);
+
+  for (const [key, val] of Object.entries(obj)) {
+    const k = key.toLowerCase();
+
+    // Key match for order IDs
+    const isOrderKey =
+      k === 'order_id' ||
+      k === 'orderid' ||
+      k === 'swiggy_order_id' ||
+      k === 'swiggyorderid' ||
+      k === 'last_order_id' ||
+      k === 'lastorderid' ||
+      k === 'active_order_id' ||
+      k === 'activeorderid' ||
+      k === 'pending_order_id' ||
+      k === 'ordernumber' ||
+      k === 'order_number';
+
+    if (isOrderKey && !isFailed) {
+      if (val && (typeof val === 'string' || typeof val === 'number')) {
+        const str = String(val).trim().replace(/^#/, '');
+        if (str && str.length >= 6 && !seen.has(str)) {
+          seen.add(str);
+          orderIds.push(str);
+        }
+      }
+    }
+
+    // Also check string values in localStorage-like maps e.g. "swiggy_last_order": "251838950110925"
+    if (typeof val === 'string' && val.length >= 10 && val.length <= 25 && /^\d+$/.test(val)) {
+      if (k.includes('order') && !k.includes('count') && !seen.has(val)) {
+        if (!isFailed) {
+          seen.add(val);
+          orderIds.push(val);
+        }
+      }
+    }
+
+    // Recurse into nested objects
+    if (val && typeof val === 'object') {
+      findOrderIdsDeep(val, seen, orderIds);
+    }
+  }
+
+  return orderIds;
+}
+
+/**
  * Analyzes parsed JSON account data to extract phone, order count, and exact order IDs.
+ * Fully supports incognito orders, active orders, and live multi-channel queries.
  * @param {object|array} parsed - The parsed JSON data
  * @param {string} rawText - Original string content
- * @returns {Promise<{ phone: string, orderCount: number, orderIds: string[], hasOrders: boolean }>}
+ * @returns {Promise<{ phone: string, orderCount: number, orderIds: string[], hasOrders: boolean, channels: string[] }>}
  */
 export async function analyzeJsonAccountOrders(parsed, rawText = '') {
   let target = parsed;
@@ -38,46 +110,23 @@ export async function analyzeJsonAccountOrders(parsed, rawText = '') {
     phone = 'Swiggy Account';
   }
 
-  const orderIds = [];
   const seenIds = new Set();
+  const orderIds = [];
+  const channels = new Set();
 
-  function addOrderId(rawId) {
+  function addOrderId(rawId, channel = 'Food') {
     if (!rawId) return;
     const str = String(rawId).trim().replace(/^#/, '');
     if (str && !seenIds.has(str)) {
       seenIds.add(str);
       orderIds.push(str);
+      if (channel) channels.add(channel);
     }
   }
 
-  // 2. Extract internal orders embedded in JSON
-  const candidates = [
-    target?.orders,
-    target?.data?.orders,
-    target?.past_orders,
-    target?.pastOrders,
-    target?.order_history,
-    target?.orderHistory,
-    target?.order_ids,
-    target?.orderIds,
-    target?.recentOrders
-  ];
-
-  for (const list of candidates) {
-    if (Array.isArray(list)) {
-      for (const item of list) {
-        if (!item) continue;
-        if (typeof item === 'string' || typeof item === 'number') {
-          addOrderId(item);
-        } else if (typeof item === 'object') {
-          const status = String(item.order_status || item.status || item.post_status || '').toLowerCase();
-          if (/failed|cancelled|canceled/.test(status)) continue;
-          const id = item.order_id || item.id || item.orderId || item.number || item.order_number;
-          if (id) addOrderId(id);
-        }
-      }
-    }
-  }
+  // 2. Deep search for any embedded order traces (incognito dumps, active orders, localStorage)
+  findOrderIdsDeep(parsed, seenIds, orderIds);
+  if (orderIds.length > 0) channels.add('Embedded');
 
   // 3. Extract order count claims if present in JSON
   const explicitCounts = [
@@ -91,18 +140,40 @@ export async function analyzeJsonAccountOrders(parsed, rawText = '') {
 
   let claimCount = explicitCounts.length > 0 ? Math.max(...explicitCounts) : 0;
 
-  // 4. If 0 orders found from embedded data, probe live Swiggy API if session tokens exist
+  // 4. Live Swiggy Multi-Channel Probing (Food, Instamart, Genie, Dineout, Profile)
   const normalized = normalizeSwiggySessionPayload(target);
   if (normalized && (normalized.cookies || normalized.tid || normalized.token || normalized._session_tid)) {
     try {
-      const res = await dapiFetch(normalized, 'order/all', { timeoutMs: 6500 }).catch(() => null);
-      const apiOrders = Array.isArray(res?.json?.data?.orders) ? res.json.data.orders : [];
-      if (apiOrders.length > 0) {
-        for (const o of apiOrders) {
+      const [foodRes, imRes, genieRes, dineRes, profRes] = await Promise.all([
+        dapiFetch(normalized, 'order/all', { timeoutMs: 6000 }).catch(() => null),
+        dapiFetch(normalized, 'order/all?order_id=&deliveryType=INSTAMART', { timeoutMs: 6000 }).catch(() => null),
+        dapiFetch(normalized, 'order/all?order_id=&deliveryType=GENIE', { timeoutMs: 6000 }).catch(() => null),
+        dapiFetch(normalized, 'order/all?order_id=&deliveryType=DINEOUT', { timeoutMs: 6000 }).catch(() => null),
+        dapiFetch(normalized, 'profile/info', { timeoutMs: 5000 }).catch(() => null)
+      ]);
+
+      const processOrders = (res, channelName) => {
+        const list = Array.isArray(res?.json?.data?.orders) ? res.json.data.orders : [];
+        for (const o of list) {
           const st = String(o?.order_status || o?.post_status || '').toLowerCase();
           if (/failed|cancelled|canceled/.test(st)) continue;
           const oid = o?.order_id || o?.id;
-          if (oid) addOrderId(oid);
+          if (oid) addOrderId(oid, channelName);
+        }
+      };
+
+      processOrders(foodRes, 'Food');
+      processOrders(imRes, 'Instamart');
+      processOrders(genieRes, 'Genie');
+      processOrders(dineRes, 'Dineout');
+
+      // Check profile info for order count
+      const profData = profRes?.json?.data;
+      if (profData) {
+        if (profData.mobile && !phone) phone = profData.mobile;
+        const profCount = Number(profData.total_orders || profData.orders_count || profData.totalOrdersCount);
+        if (Number.isFinite(profCount) && profCount > claimCount) {
+          claimCount = profCount;
         }
       }
     } catch (_) {}
@@ -115,6 +186,7 @@ export async function analyzeJsonAccountOrders(parsed, rawText = '') {
     phone,
     orderCount: finalOrderCount,
     orderIds,
-    hasOrders
+    hasOrders,
+    channels: Array.from(channels)
   };
 }
