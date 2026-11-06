@@ -275,11 +275,11 @@ export function buildSwiggyAndroidClientHeaders(accountOrCookies, opts = {}) {
 // AND `item_offer_cart_meta` across EVERY `chkout` / `dapi` cart update & rehydration call!
 export function buildSwiggyCartItemsPayload(items) {
   return (Array.isArray(items) ? items : [])
-    .filter(it => it && (it.menu_item_id || it.itemId))
+    .filter(it => it && (it.menu_item_id || it.itemId || it.id))
     .map(it => ({
       addons: Array.isArray(it.addons) ? it.addons : [],
       variants: Array.isArray(it.variants) ? it.variants : [],
-      menu_item_id: Number(it.menu_item_id || it.itemId),
+      menu_item_id: Number(it.menu_item_id || it.itemId || it.id),
       quantity: Number(it.qty || it.quantity || 1),
       offer_ids: Array.isArray(it.offer_ids) ? it.offer_ids : [],
       item_offer_cart_meta: String(it.item_offer_cart_meta || ''),

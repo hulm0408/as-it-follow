@@ -3,12 +3,12 @@
 // ----------------------------------------------------------------------------
 // - 100% Monospace UI (<pre><code>) on all bot responses
 // - Real Swiggy API Restaurant Search at user's delivery location
-// - Real Swiggy Outlets selector
-// - Real Swiggy Menu dishes & price inspection
-// - Real Swiggy Customization / Variant picker
+// - Real Swiggy Outlets selector (short callback data under 64 bytes)
+// - Real Swiggy Menu dishes & EXACT live prices (no mock/dummy markups)
 // - Real Swiggy Login with JSON / Token & Logout
 // - Offer Claim: ₹50 Refer Cash + ₹50 BHIM UPI Discount
-// - Instant Real UPI QR generation (genuine upi:// URI -> PNG buffer)
+// - Real Swiggy Merchant UPI QR via generateRealSwiggyMerchantUpiQr
+// - Zero fake dummy fallbacks
 // ============================================================================
 
 import QRCode from 'qrcode';
@@ -18,6 +18,7 @@ import {
   resolveSwiggyLink,
   fetchFastRestaurantInfo,
   claimInstamartFreeCash,
+  generateRealSwiggyMerchantUpiQr,
   dapiFetch
 } from './swiggy-cart.js';
 import {
@@ -29,7 +30,7 @@ import {
 // In-memory state tracking per user
 const userState = new Map();
 
-function getState(userId) {
+export function getState(userId) {
   const key = String(userId);
   if (!userState.has(key)) {
     userState.set(key, {
@@ -39,12 +40,16 @@ function getState(userId) {
       bhimApplied: true,
       address: null,
       addressLink: null,
-      lat: '26.8658609',
-      lng: '80.9307755',
+      lat: null,
+      lng: null,
       restaurant: null,
       menuData: null,
       cart: [],
-      pendingItem: null
+      pendingOutlets: [],
+      pendingDishes: [],
+      currentOrderId: null,
+      currentToPay: 0,
+      currentUpiUri: null
     });
   }
   return userState.get(key);
@@ -56,7 +61,7 @@ function mono(text) {
 
 export function formatDashboard(s) {
   const acc = s.account ? (s.account.phone ? maskPhoneStars(s.account.phone) : 'LOGGED IN') : 'NO ACCOUNT';
-  const addr = s.address ? (s.address.name || s.address.address ? `${String(s.address.address || '').slice(0, 20)}...` : 'SET') : 'NOT SET';
+  const addr = s.address ? (s.address.name || s.address.address ? `${String(s.address.address || '').slice(0, 22)}...` : 'SET') : 'NOT SET';
   const cash = s.referClaimed ? '₹50 ACTIVE' : 'UNCLAIMED';
   const bhim = s.bhimApplied ? '-₹50' : 'NONE';
   const itemsCount = s.cart.reduce((sum, it) => sum + (it.qty || 1), 0);
@@ -118,8 +123,12 @@ export async function searchRealRestaurants(query, lat = '26.8658609', lng = '80
       else Object.values(n).forEach(walk);
     };
 
-    // 1. Try dedicated live search endpoint (accurate city-wide matching)
-    const searchRes = await dapiFetch(account, `restaurants/search/v3?lat=${lat}&lng=${lng}&str=${encodeURIComponent(query)}&trackingId=undefined&submitAction=ENTER`, { timeoutMs: 9000 });
+    // 1. Dedicated live search endpoint
+    const searchRes = await dapiFetch(
+      account,
+      `restaurants/search/v3?lat=${lat}&lng=${lng}&str=${encodeURIComponent(query)}&trackingId=undefined&submitAction=ENTER`,
+      { timeoutMs: 9000 }
+    );
     walk(searchRes?.json?.data);
 
     // 2. Fall back to home feed list if search returned no direct outlet matches
@@ -129,7 +138,6 @@ export async function searchRealRestaurants(query, lat = '26.8658609', lng = '80
     }
 
     const q = query.toLowerCase().trim();
-    // Substring or word match
     const matched = allRests.filter(
       (r) => r.name.toLowerCase().includes(q) || q.includes(r.name.toLowerCase())
     );
@@ -142,7 +150,7 @@ export async function searchRealRestaurants(query, lat = '26.8658609', lng = '80
 }
 
 /**
- * Searches real dishes on a Swiggy restaurant's menu.
+ * Searches real dishes on a Swiggy restaurant's menu with EXACT live prices.
  */
 export async function searchRealMenuItems(restaurantId, itemQuery, lat = '26.8658609', lng = '80.9307755') {
   try {
@@ -244,9 +252,19 @@ export function setupToingBot(bot) {
   bot.action('tb_cart_prompt', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const s = getState(ctx.from.id);
+
+    if (!s.address || !s.lat || !s.lng) {
+      s.step = 'AWAITING_ADDRESS_LINK';
+      await ctx.reply(
+        mono('SET ADDRESS FIRST\n----------------------\nPLEASE SEND SWIGGY ADDRESS LINK FIRST\nSO WE CAN FIND OUTLETS DELIVERING TO YOU.\n----------------------'),
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
     s.step = 'AWAITING_REST_NAME';
     await ctx.reply(
-      mono('ENTER RESTAURANT NAME:'),
+      mono('ENTER RESTAURANT NAME:\n(OR PASTE SWIGGY RESTAURANT LINK)'),
       { parse_mode: 'HTML' }
     );
   });
@@ -280,7 +298,7 @@ export function setupToingBot(bot) {
     }
 
     for (const it of s.cart) {
-      lines.push(`${it.name} (${it.variant || 'Regular'})`);
+      lines.push(`${it.name}`);
       lines.push(`₹${it.price} × ${it.qty || 1} = ₹${it.price * (it.qty || 1)}`);
     }
 
@@ -292,9 +310,6 @@ export function setupToingBot(bot) {
     lines.push('----------------------');
     lines.push(`TO PAY     : ₹${toPay}`);
 
-    // Keep short orderId so callback_data never exceeds 64 bytes
-    const orderId = String(Date.now()).slice(-8);
-    s.currentOrderId = orderId;
     s.currentToPay = toPay;
 
     await ctx.reply(mono(lines.join('\n')), {
@@ -302,7 +317,7 @@ export function setupToingBot(bot) {
       reply_markup: {
         inline_keyboard: [
           [
-            { text: '💳 PAY UPI QR', callback_data: `tb_pay_${orderId}` },
+            { text: '💳 PAY UPI QR', callback_data: 'tb_pay_qr' },
             { text: '❌ CLEAR', callback_data: 'tb_clear_cart' }
           ]
         ]
@@ -310,43 +325,136 @@ export function setupToingBot(bot) {
     });
   });
 
-  // 8. Generate UPI Payment QR (FIXED: valid string URI passed to QRCode)
-  bot.action(/^tb_pay_(\d+)$/, async (ctx) => {
-    const orderId = ctx.match[1];
-    await ctx.answerCbQuery('Generating QR...').catch(() => {});
+  // 8. Generate Real Swiggy Payment QR (100% Genuine Swiggy Merchant QR)
+  bot.action('tb_pay_qr', async (ctx) => {
+    await ctx.answerCbQuery('Processing Swiggy Order...').catch(() => {});
     const s = getState(ctx.from.id);
-    const toPay = s.currentToPay || 29;
 
-    // Genuine UPI URI string
-    const vpa = 'swiggyorder@icici';
-    const name = 'Swiggy';
-    const upiUri = `upi://pay?pa=${encodeURIComponent(vpa)}&pn=${encodeURIComponent(name)}&am=${toPay.toFixed(2)}&cu=INR&tn=${encodeURIComponent(`Swiggy Order ${orderId}`)}`;
+    if (!s.account || !s.account.isLoggedIn) {
+      await ctx.reply(
+        mono('LOGIN REQUIRED\n----------------------\nTOING CREATES GENUINE SWIGGY ORDERS.\nPLEASE LOGIN WITH SWIGGY JSON FIRST:\nCLICK [ 🔑 LOGIN ]\n----------------------'),
+        { parse_mode: 'HTML', ...getMainMenuKeyboard(s) }
+      );
+      return;
+    }
+
+    if (!s.address || !s.lat || !s.lng) {
+      await ctx.reply(
+        mono('ADDRESS REQUIRED\n----------------------\nPLEASE SET DELIVERY ADDRESS FIRST:\nCLICK [ 📍 ADDRESS ]\n----------------------'),
+        { parse_mode: 'HTML', ...getMainMenuKeyboard(s) }
+      );
+      return;
+    }
+
+    if (!s.restaurant || !s.restaurant.id) {
+      await ctx.reply(
+        mono('RESTAURANT REQUIRED\n----------------------\nPLEASE SELECT A RESTAURANT FIRST:\nCLICK [ 🛒 ADD ITEM ]\n----------------------'),
+        { parse_mode: 'HTML', ...getMainMenuKeyboard(s) }
+      );
+      return;
+    }
+
+    if (!s.cart.length) {
+      await ctx.reply(
+        mono('CART IS EMPTY\n----------------------\nPLEASE ADD ITEMS FIRST:\nCLICK [ 🛒 ADD ITEM ]\n----------------------'),
+        { parse_mode: 'HTML', ...getMainMenuKeyboard(s) }
+      );
+      return;
+    }
+
+    const waitMsg = await ctx.reply(
+      mono('PLACING LIVE SWIGGY ORDER & FETCHING GENUINE PAYMENT QR...'),
+      { parse_mode: 'HTML' }
+    );
+
+    const orderPayload = {
+      id: `TOING_${Date.now()}`,
+      restaurantId: String(s.restaurant.id),
+      restaurantName: s.restaurant.name,
+      items: s.cart.map((it) => ({
+        menu_item_id: Number(it.id || it.itemId),
+        itemId: Number(it.id || it.itemId),
+        id: String(it.id || it.itemId),
+        name: it.name,
+        price: Number(it.price),
+        quantity: Number(it.qty || 1),
+        qty: Number(it.qty || 1),
+        variants: [],
+        addons: []
+      })),
+      addressDetails: {
+        ...s.address,
+        id: s.address.id || '',
+        name: s.address.name || 'Customer',
+        mobile: s.address.mobile || s.account.phone,
+        address: s.address.address,
+        lat: String(s.lat),
+        lng: String(s.lng)
+      },
+      finalPayable: Number(s.currentToPay || 0)
+    };
 
     try {
-      const qrBuffer = await QRCode.toBuffer(upiUri, {
+      const realQr = await generateRealSwiggyMerchantUpiQr(s.account, orderPayload);
+      await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
+
+      if (!realQr || !realQr.upiIntentUrl) {
+        throw new Error('Swiggy did not return a valid UPI payment intent URL.');
+      }
+
+      s.currentOrderId = realQr.swiggyOrderId;
+      s.currentUpiUri = realQr.upiIntentUrl;
+
+      const qrBuffer = await QRCode.toBuffer(realQr.upiIntentUrl, {
         type: 'png',
         width: 450,
-        margin: 2
+        margin: 2,
+        errorCorrectionLevel: 'M'
       });
+
+      const captionLines = [
+        'SWIGGY OFFICIAL PAYMENT QR',
+        '----------------------',
+        `ORDER ID : #${realQr.swiggyOrderId}`,
+        `RESTAURANT: ${realQr.restaurantName || s.restaurant.name}`,
+        `TO PAY   : ₹${realQr.amount}`,
+        `MERCHANT : SWIGGY (ICICI)`,
+        '----------------------',
+        'SCAN VIA GPAY / PHONEPE / PAYTM / BHIM',
+        'PAYMENT DIRECTLY CONFIRMS SWIGGY ORDER'
+      ];
 
       await ctx.replyWithPhoto(
         { source: qrBuffer },
         {
-          caption: mono(`SCAN & PAY: ₹${toPay}\nORDER ID: #${orderId}`),
+          caption: mono(captionLines.join('\n')),
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
               [
                 { text: '❌ CANCEL', callback_data: 'tb_cancel_order' },
-                { text: '✅ PAID', callback_data: `tb_paid_${orderId}` }
+                { text: '✅ I HAVE PAID', callback_data: `tb_paid_${realQr.swiggyOrderId}` }
               ]
             ]
           }
         }
       );
     } catch (err) {
-      console.error('[QR GENERATE ERROR]', err);
-      await ctx.reply(mono(`QR GENERATE FAILED: ${err.message}`), { parse_mode: 'HTML' });
+      await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
+      console.error('[SWIGGY REAL QR ERROR]', err);
+      const errLines = [
+        'SWIGGY CHECKOUT STOPPED',
+        '----------------------',
+        `REASON : ${err.message}`,
+        `STAGE  : ${err.diag?.stage || 'CHECKOUT'}`,
+        '----------------------',
+        'NO FAKE QR GENERATED.',
+        'PLEASE RESOLVE THE REASON ABOVE.'
+      ];
+      await ctx.reply(mono(errLines.join('\n')), {
+        parse_mode: 'HTML',
+        ...getMainMenuKeyboard(s)
+      });
     }
   });
 
@@ -406,80 +514,60 @@ export function setupToingBot(bot) {
     });
   });
 
-  // Outlet picker action (stores real restaurant ID)
-  bot.action(/^tb_outlet_(\d+)__(.+)$/, async (ctx) => {
+  // Outlet picker action: uses short index into s.pendingOutlets (< 15 bytes callback_data)
+  bot.action(/^tb_outlet_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const s = getState(ctx.from.id);
-    const restId = ctx.match[1];
-    const restName = decodeURIComponent(ctx.match[2]);
+    const index = parseInt(ctx.match[1], 10);
+    const chosen = s.pendingOutlets?.[index];
 
-    s.restaurant = { id: restId, name: restName };
+    if (!chosen) {
+      await ctx.reply(mono('OUTLET SELECTION EXPIRED\nENTER RESTAURANT NAME AGAIN:'), { parse_mode: 'HTML' });
+      s.step = 'AWAITING_REST_NAME';
+      return;
+    }
+
+    s.restaurant = { id: String(chosen.id), name: chosen.name, area: chosen.area };
     s.step = 'AWAITING_ITEM_NAME';
 
     // Pre-fetch real Swiggy menu in background
-    fetchFastRestaurantInfo(restId, s.lat, s.lng, true).then((m) => {
+    fetchFastRestaurantInfo(chosen.id, s.lat, s.lng, true).then((m) => {
       s.menuData = m;
     }).catch(() => {});
 
     await ctx.reply(
-      mono(`OUTLET SELECTED:\n${restName}\n\nENTER ITEM NAME:`),
+      mono(`OUTLET SELECTED:\n${chosen.name} (${chosen.area || 'Main'})\n\nENTER ITEM NAME:`),
       { parse_mode: 'HTML' }
     );
   });
 
-  // Real dish item picker action
-  bot.action(/^tb_dish_(\d+)__(.+)__(\d+)$/, async (ctx) => {
+  // Real dish item picker action: uses short index into s.pendingDishes
+  bot.action(/^tb_dish_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const s = getState(ctx.from.id);
-    const dishId = ctx.match[1];
-    const dishName = decodeURIComponent(ctx.match[2]);
-    const price = Number(ctx.match[3]);
+    const index = parseInt(ctx.match[1], 10);
+    const dish = s.pendingDishes?.[index];
 
-    s.pendingItem = {
-      id: dishId,
-      name: dishName,
-      price: price > 0 ? price : 149,
-      variant: 'Regular',
-      qty: 1
-    };
-
-    // Check if item is customizable
-    const isCustomizable = /burger|pizza|sandwich|sub|wrap|thali|bowl|biryani|cake/i.test(dishName);
-
-    if (isCustomizable) {
-      s.step = 'AWAITING_CUSTOMIZATION';
-      await ctx.reply(
-        mono(`ITEM: ${dishName}\nPRICE: ₹${price}\n\nCHOOSE VARIANT:`),
-        {
-          parse_mode: 'HTML',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: 'Regular', callback_data: 'tb_variant_Regular__0' },
-                { text: 'Medium (+₹40)', callback_data: 'tb_variant_Medium__40' }
-              ],
-              [
-                { text: 'Large (+₹80)', callback_data: 'tb_variant_Large__80' }
-              ]
-            ]
-          }
-        }
-      );
+    if (!dish) {
+      await ctx.reply(mono('ITEM SELECTION EXPIRED\nENTER ITEM NAME AGAIN:'), { parse_mode: 'HTML' });
+      s.step = 'AWAITING_ITEM_NAME';
       return;
     }
 
+    const dishPrice = Number(dish.price);
+
     s.step = 'AWAITING_QTY';
     await ctx.reply(
-      mono(`ITEM: ${dishName}\nPRICE: ₹${price}\n\nCHOOSE QUANTITY:`),
+      mono(`ITEM : ${dish.name}\nPRICE: ₹${dishPrice}\n\nCHOOSE QUANTITY:`),
       {
         parse_mode: 'HTML',
         reply_markup: {
           inline_keyboard: [
             [
-              { text: '1', callback_data: 'tb_qty_1' },
-              { text: '2', callback_data: 'tb_qty_2' },
-              { text: '3', callback_data: 'tb_qty_3' },
-              { text: '4', callback_data: 'tb_qty_4' }
+              { text: '1', callback_data: `tb_qty_${index}_1` },
+              { text: '2', callback_data: `tb_qty_${index}_2` },
+              { text: '3', callback_data: `tb_qty_${index}_3` },
+              { text: '4', callback_data: `tb_qty_${index}_4` }
             ]
           ]
         }
@@ -487,63 +575,43 @@ export function setupToingBot(bot) {
     );
   });
 
-  // Variant/Customization picker
-  bot.action(/^tb_variant_(.+)__(\d+)$/, async (ctx) => {
+  // Quantity picker: uses dishIndex and qty with EXACT menu price
+  bot.action(/^tb_qty_(\d+)_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const s = getState(ctx.from.id);
-    const variant = ctx.match[1];
-    const extraPrice = Number(ctx.match[2] || 0);
+    const dishIndex = parseInt(ctx.match[1], 10);
+    const qty = parseInt(ctx.match[2], 10) || 1;
+    const dish = s.pendingDishes?.[dishIndex];
 
-    if (s.pendingItem) {
-      s.pendingItem.variant = variant;
-      s.pendingItem.price += extraPrice;
+    if (!dish) {
+      await ctx.reply(mono('ITEM SELECTION EXPIRED\nPLEASE SEARCH AGAIN:'), { parse_mode: 'HTML' });
+      s.step = 'AWAITING_ITEM_NAME';
+      return;
     }
-    s.step = 'AWAITING_QTY';
 
-    await ctx.reply(
-      mono(`CUSTOMIZATION: ${variant}\nPRICE: ₹${s.pendingItem?.price}\n\nCHOOSE QUANTITY:`),
-      {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: '1', callback_data: 'tb_qty_1' },
-              { text: '2', callback_data: 'tb_qty_2' },
-              { text: '3', callback_data: 'tb_qty_3' },
-              { text: '4', callback_data: 'tb_qty_4' }
-            ]
-          ]
-        }
-      }
-    );
-  });
+    const price = Number(dish.price);
+    s.cart.push({
+      id: String(dish.id),
+      menu_item_id: Number(dish.id),
+      itemId: Number(dish.id),
+      name: dish.name,
+      price: price,
+      qty: qty
+    });
 
-  // Quantity picker
-  bot.action(/^tb_qty_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery().catch(() => {});
-    const s = getState(ctx.from.id);
-    const qty = parseInt(ctx.match[1], 10) || 1;
+    s.step = 'IDLE';
 
-    if (s.pendingItem) {
-      s.pendingItem.qty = qty;
-      s.cart.push({ ...s.pendingItem });
-      const added = s.pendingItem;
-      s.pendingItem = null;
-      s.step = 'IDLE';
-
-      const lines = [
-        'ITEM ADDED TO CART',
-        '----------------------',
-        `ITEM     : ${added.name}`,
-        `VARIANT  : ${added.variant || 'Regular'}`,
-        `PRICE    : ₹${added.price} × ${qty}`,
-        '----------------------'
-      ];
-      await ctx.reply(mono(lines.join('\n')), {
-        parse_mode: 'HTML',
-        ...getMainMenuKeyboard(s)
-      });
-    }
+    const lines = [
+      'ITEM ADDED TO CART',
+      '----------------------',
+      `ITEM  : ${dish.name}`,
+      `PRICE : ₹${price} × ${qty} = ₹${price * qty}`,
+      '----------------------'
+    ];
+    await ctx.reply(mono(lines.join('\n')), {
+      parse_mode: 'HTML',
+      ...getMainMenuKeyboard(s)
+    });
   });
 
   // 10. Document Handler (Login with JSON file)
@@ -568,10 +636,14 @@ export function setupToingBot(bot) {
       const phone = normalized?.phone || normalized?.mobile || parsed?.phone || 'Swiggy User';
 
       s.account = {
+        ...normalized,
         phone,
         cookies: normalized?.cookies || '',
         tid: normalized?.tid || '',
         token: normalized?.token || '',
+        _session_tid: normalized?._session_tid || '',
+        sid: normalized?.sid || '',
+        deviceId: normalized?.deviceId || '',
         isLoggedIn: true
       };
       s.step = 'IDLE';
@@ -606,10 +678,14 @@ export function setupToingBot(bot) {
         const normalized = normalizeSwiggySessionPayload(parsed);
         const phone = normalized?.phone || normalized?.mobile || parsed?.phone || 'Swiggy User';
         s.account = {
+          ...normalized,
           phone,
           cookies: normalized?.cookies || '',
           tid: normalized?.tid || '',
           token: normalized?.token || '',
+          _session_tid: normalized?._session_tid || '',
+          sid: normalized?.sid || '',
+          deviceId: normalized?.deviceId || '',
           isLoggedIn: true
         };
         s.step = 'IDLE';
@@ -677,7 +753,6 @@ export function setupToingBot(bot) {
             });
             return;
           } else {
-            // Address could NOT be resolved from Swiggy link
             s.address = null;
             const errLines = [
               'COULD NOT FETCH ADDRESS',
@@ -734,13 +809,35 @@ export function setupToingBot(bot) {
     // Case C: Awaiting Restaurant Name (REAL SWIGGY SEARCH)
     if (s.step === 'AWAITING_REST_NAME') {
       const query = text;
-      const searchStatus = await ctx.reply(mono(`SEARCHING SWIGGY FOR "${query.toUpperCase()}"...`), { parse_mode: 'HTML' });
 
-      const { allRests, matched } = await searchRealRestaurants(query, s.lat, s.lng, s.account);
+      // Check if user pasted a direct Swiggy restaurant link
+      const directRestMatch = query.match(/\/restaurants\/[^\/\s?]+-([0-9]+)/i) || query.match(/restaurant_id=([0-9]+)/i);
+      if (directRestMatch) {
+        const restId = directRestMatch[1];
+        const fetchMsg = await ctx.reply(mono('FETCHING RESTAURANT DETAILS...'), { parse_mode: 'HTML' });
+        const menuInfo = await fetchFastRestaurantInfo(restId, s.lat || '26.8658609', s.lng || '80.9307755', true);
+        await ctx.telegram.deleteMessage(ctx.chat.id, fetchMsg.message_id).catch(() => {});
+
+        if (menuInfo?.name) {
+          s.restaurant = { id: restId, name: menuInfo.name, area: menuInfo.city || '' };
+          s.menuData = menuInfo;
+          s.step = 'AWAITING_ITEM_NAME';
+          await ctx.reply(
+            mono(`RESTAURANT: ${menuInfo.name}\n\nENTER ITEM NAME:`),
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+      }
+
+      const searchLat = s.lat || '26.8658609';
+      const searchLng = s.lng || '80.9307755';
+
+      const searchStatus = await ctx.reply(mono(`SEARCHING SWIGGY FOR "${query.toUpperCase()}"...`), { parse_mode: 'HTML' });
+      const { allRests, matched } = await searchRealRestaurants(query, searchLat, searchLng, s.account);
       await ctx.telegram.deleteMessage(ctx.chat.id, searchStatus.message_id).catch(() => {});
 
       if (!matched.length) {
-        // Show suggestions from allRests in area
         const sampleSuggestions = allRests.slice(0, 5).map(r => `• ${r.name} (${r.area})`).join('\n');
         const errLines = [
           `NO OUTLET FOUND FOR "${query.toUpperCase()}"`,
@@ -754,13 +851,16 @@ export function setupToingBot(bot) {
         return;
       }
 
+      // Store matched outlets for safe short callback_data
+      s.pendingOutlets = matched.slice(0, 8);
+
       // If multiple outlets found: show outlet choice buttons
       if (matched.length > 1) {
         s.step = 'AWAITING_OUTLET_CHOICE';
-        const buttons = matched.slice(0, 6).map((r) => [
+        const buttons = s.pendingOutlets.map((r, i) => [
           {
-            text: `${r.name} (${r.area || 'Outlet'})`,
-            callback_data: `tb_outlet_${r.id}__${encodeURIComponent(r.name)}`
+            text: `${r.name.slice(0, 20)} (${(r.area || 'Outlet').slice(0, 10)})`,
+            callback_data: `tb_outlet_${i}`
           }
         ]);
 
@@ -776,16 +876,16 @@ export function setupToingBot(bot) {
 
       // Single outlet matched
       const chosen = matched[0];
-      s.restaurant = { id: chosen.id, name: chosen.name };
+      s.restaurant = { id: chosen.id, name: chosen.name, area: chosen.area };
       s.step = 'AWAITING_ITEM_NAME';
 
       // Pre-fetch real menu in background
-      fetchFastRestaurantInfo(chosen.id, s.lat, s.lng, true).then((m) => {
+      fetchFastRestaurantInfo(chosen.id, searchLat, searchLng, true).then((m) => {
         s.menuData = m;
       }).catch(() => {});
 
       await ctx.reply(
-        mono(`RESTAURANT: ${chosen.name} (${chosen.area})\n\nENTER ITEM NAME:`),
+        mono(`RESTAURANT: ${chosen.name} (${chosen.area || 'Main'})\n\nENTER ITEM NAME:`),
         { parse_mode: 'HTML' }
       );
       return;
@@ -803,17 +903,15 @@ export function setupToingBot(bot) {
       }
 
       const searchItemMsg = await ctx.reply(mono(`SEARCHING MENU FOR "${itemName.toUpperCase()}"...`), { parse_mode: 'HTML' });
-
-      const { menu, matches } = await searchRealMenuItems(restId, itemName, s.lat, s.lng);
+      const { menu, matches } = await searchRealMenuItems(restId, itemName, s.lat || '26.8658609', s.lng || '80.9307755');
       await ctx.telegram.deleteMessage(ctx.chat.id, searchItemMsg.message_id).catch(() => {});
 
       if (!matches.length) {
-        // Show sample dishes from menu
         const sampleDishes = (menu?.menuItems || []).slice(0, 5).map(it => `• ${it.name} - ₹${it.price}`).join('\n');
         const errLines = [
           `ITEM "${itemName.toUpperCase()}" NOT FOUND`,
           '----------------------',
-          'POPULAR ON THIS MENU:',
+          'AVAILABLE ON THIS MENU:',
           sampleDishes || 'No menu items available',
           '----------------------',
           'ENTER ITEM NAME AGAIN:'
@@ -822,11 +920,13 @@ export function setupToingBot(bot) {
         return;
       }
 
-      // Present matched real dishes as buttons
-      const buttons = matches.slice(0, 6).map((it) => [
+      // Store matched dishes for safe short callback_data
+      s.pendingDishes = matches.slice(0, 8);
+
+      const buttons = s.pendingDishes.map((it, i) => [
         {
-          text: `${it.name} - ₹${it.price}`,
-          callback_data: `tb_dish_${it.id}__${encodeURIComponent(it.name.slice(0, 24))}__${it.price || 149}`
+          text: `${it.name.slice(0, 24)} - ₹${it.price}`,
+          callback_data: `tb_dish_${i}`
         }
       ]);
 
