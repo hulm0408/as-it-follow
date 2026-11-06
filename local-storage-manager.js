@@ -113,3 +113,4 @@ export function getLocalStorageStats() {
     return { totalFiles: 0, withOrders: 0, zeroOrders: 0, totalOrders: 0 };
   }
 }
+

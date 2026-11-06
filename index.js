@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Telegraf } from 'telegraf';
-import { setupChatFlow } from './chat-flow.js';
+import { setupToingBot } from './toing-bot.js';
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -10,8 +10,8 @@ if (!token) {
 
 const bot = new Telegraf(token);
 
-// Mount the Figma Telegram Order Bot Chat Flow
-setupChatFlow(bot);
+// Mount TOING Bot Engine
+setupToingBot(bot);
 
 // Error catcher
 bot.catch((err, ctx) => {
@@ -20,7 +20,7 @@ bot.catch((err, ctx) => {
 
 // Launch bot
 bot.launch().then(() => {
-  console.log('[BOT LIVE] Telegram Slot Bot running with Figma Chat Flow!');
+  console.log('[TOING BOT LIVE] Ready on Telegram!');
 }).catch((err) => {
   console.error('[LAUNCH ERROR]', err);
   process.exit(1);
