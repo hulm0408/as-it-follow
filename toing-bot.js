@@ -21,6 +21,7 @@ import {
   claimInstamartFreeCash,
   generateRealSwiggyMerchantUpiQr,
   saveAddressToAccount,
+  swiggyCartFlush,
   swiggyCartUpdate,
   parseDapiCartPayload,
   buildSwiggyCartItemsPayload,
@@ -348,7 +349,7 @@ export function setupToingBot(bot) {
     if (s.account && s.address && s.lat && s.lng) {
       const waitMsg = await ctx.reply(mono('CONNECTING TO SWIGGY & FETCHING OFFICIAL BILL...'), { parse_mode: 'HTML' });
       try {
-        // Ensure address is saved and bound to this account on Swiggy
+        // 1. Ensure address is saved and bound to this account on Swiggy
         if (!s.address.id) {
           const savedRes = await saveAddressToAccount(s.account, s.address);
           if (savedRes?.addressId) {
@@ -359,6 +360,10 @@ export function setupToingBot(bot) {
           }
         }
 
+        // 2. Explicitly flush old leftover items on Swiggy so ONLY s.cart items exist
+        await swiggyCartFlush(s.account, { lat: String(s.lat), lng: String(s.lng) }).catch(() => {});
+
+        // 3. Update cart on Swiggy with the EXACT current items
         const syncRes = await swiggyCartUpdate(
           s.account,
           {
@@ -395,9 +400,13 @@ export function setupToingBot(bot) {
             '----------------------'
           ];
 
-          for (const it of s.cart) {
+          // Display items confirmed on Swiggy cart (or s.cart)
+          const displayItems = Array.isArray(liveCart.items) && liveCart.items.length > 0 ? liveCart.items : s.cart;
+          for (const it of displayItems) {
+            const qty = it.qty || it.quantity || 1;
+            const price = it.price || (it.lineTotal ? Math.round(it.lineTotal / qty) : 0);
             lines.push(`${it.name}`);
-            lines.push(`₹${it.price} × ${it.qty || 1} = ₹${it.price * (it.qty || 1)}`);
+            lines.push(`₹${price} × ${qty} = ₹${price * qty}`);
           }
 
           lines.push('----------------------');
@@ -639,6 +648,9 @@ export function setupToingBot(bot) {
     const s = getState(ctx.from.id);
     s.cart = [];
     s.liveCart = null;
+    if (s.account) {
+      swiggyCartFlush(s.account, { lat: String(s.lat || '26.8658609'), lng: String(s.lng || '80.9307755') }).catch(() => {});
+    }
     await ctx.reply(mono('CART CLEARED'), {
       parse_mode: 'HTML',
       ...getMainMenuKeyboard(s)
@@ -674,6 +686,14 @@ export function setupToingBot(bot) {
         { parse_mode: 'HTML' }
       );
       return;
+    }
+
+    if (s.restaurant && s.restaurant.id !== String(chosen.id)) {
+      s.cart = [];
+      s.liveCart = null;
+      if (s.account) {
+        swiggyCartFlush(s.account, { lat: String(s.lat || '26.8658609'), lng: String(s.lng || '80.9307755') }).catch(() => {});
+      }
     }
 
     s.restaurant = { id: String(chosen.id), name: chosen.name, area: chosen.area };
