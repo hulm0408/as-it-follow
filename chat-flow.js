@@ -28,7 +28,7 @@
 
 import QRCode from 'qrcode';
 import { extractSharedUrls, normalizeSharedUrl } from './link-utils.js';
-import { analyzeJsonAccountOrders } from './json-analyzer.js';
+import { analyzeJsonAccountOrders, formatOrderHistoryMonospace } from './json-analyzer.js';
 import {
   parseAddressDetails,
   parseCartDetails,
@@ -252,30 +252,29 @@ export function setupChatFlow(bot) {
       await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
 
       if (analysis.hasOrders) {
-        const orderList = analysis.orderIds.length
-          ? analysis.orderIds.slice(0, 15).map((id) => `• <code>#${id}</code>`).join('\n')
-          : `• Verified order count: ${analysis.orderCount}`;
+        // Send organized monospace history card (ORDER ID, VALUE, WHEN PLACED)
+        const monoHistory = formatOrderHistoryMonospace({
+          fileName,
+          phone: analysis.phone,
+          orderCount: analysis.orderCount,
+          orders: analysis.orders
+        });
 
-        const caption =
-          `✅ <b>${fileName}</b>\n` +
-          `📱 <b>Account:</b> <code>${analysis.phone}</code>\n` +
-          `📦 <b>Total Orders:</b> <code>${analysis.orderCount}</code>\n` +
-          `🔢 <b>Exact Order Numbers:</b>\n${orderList}`;
+        await ctx.reply(monoHistory, { parse_mode: 'HTML' });
 
-        // Send the file back with the order details
+        // Send the file back
         await ctx.replyWithDocument(
           { source: Buffer.from(text, 'utf-8'), filename: fileName },
-          { caption, parse_mode: 'HTML' }
+          { caption: `✅ ${fileName} — Returned (${analysis.orderCount} orders)` }
         );
       } else {
         // No orders: DO NOT SEND THE FILE BACK
-        await ctx.reply(
-          `⚪ <b>${fileName}</b>\n` +
-          `📱 <b>Account:</b> <code>${analysis.phone}</code>\n` +
-          `📦 <b>Total Orders:</b> <code>0</code>\n` +
-          `<i>No orders found — file not returned.</i>`,
-          { parse_mode: 'HTML' }
-        );
+        const zeroCard =
+          `<pre><code>ACCOUNT  : ${analysis.phone || 'Unknown'}\n` +
+          `FILE     : ${fileName}\n` +
+          `ORDERS   : 0 (No orders found — file not returned)</code></pre>`;
+
+        await ctx.reply(zeroCard, { parse_mode: 'HTML' });
       }
     } catch (err) {
       await ctx.telegram.editMessageText(
