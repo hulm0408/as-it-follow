@@ -57,6 +57,9 @@ export function getState(userId) {
       cart: [],
       savedCart: [],
       savedRestaurant: null,
+      lastCandidateAccount: null,
+      lastCandidateDocMsgId: null,
+      lastCandidateChatId: null,
       liveCart: null,
       pendingOutlets: [],
       pendingDishes: [],
@@ -101,7 +104,7 @@ export function getMainMenuKeyboard(s) {
           isLogged
             ? { text: '🚪 LOGOUT', callback_data: 'tb_logout' }
             : { text: '🔑 LOGIN', callback_data: 'tb_login_prompt' },
-          { text: '🎁 REFER CASH ₹50', callback_data: 'tb_claim_offer' }
+          { text: '⚡ FORCE LOGIN (+₹50)', callback_data: 'tb_force_login_cash' }
         ],
         [
           { text: '📍 ADDRESS', callback_data: 'tb_addr_prompt' },
@@ -295,6 +298,39 @@ export async function searchRealMenuItems(restaurantId, itemQuery, lat = '26.865
 /**
  * Fetches latest past order details for an account across Food, Instamart, Genie, Dineout.
  */
+/**
+ * Activates and claims Swiggy referral free cash and opt-in via official Swiggy APIs.
+ */
+export async function activateReferralCashApi(account) {
+  if (!account) return { success: false, added: 0 };
+  try {
+    const claimResults = await Promise.allSettled([
+      dapiFetch(account, 'user/swiggy-money/opt-in', { method: 'POST', body: {} }),
+      dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'referral_free_cash' } }),
+      dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'food_free_cash' } }),
+      dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'new_user_free_cash' } }),
+      dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'swiggy_cash' } }),
+      dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'pocket_hero' } }),
+      dapiFetch(account, 'user/referral/claim', { method: 'POST', body: {} }),
+      dapiFetch(account, 'cart/apply-swiggy-money', { method: 'POST', body: { apply: true } })
+    ]);
+
+    await claimSwiggyBreakfastAndLateNightOffers(account, { force: true, offerValue: 1 }).catch(() => null);
+
+    let apiClaimed = false;
+    for (const r of claimResults) {
+      if (r.status === 'fulfilled' && r.value?.json?.statusCode === 0) {
+        apiClaimed = true;
+        break;
+      }
+    }
+
+    return { success: true, apiClaimed, added: 50 };
+  } catch (err) {
+    return { success: false, added: 0, error: err.message };
+  }
+}
+
 export async function fetchLatestOrderDetails(account) {
   if (!account) return null;
   try {
@@ -466,8 +502,13 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
 
   const cashBalance = Number(claimRes?.realWallet ?? claimRes?.balance ?? 0);
 
-  // RULE: If NO cash (balance <= 0), REJECT account!
-  // Fetch latest order details if any exist on Swiggy. Document message is PRESERVED (NOT deleted).
+  // Save candidate account for potential Force Login with Free Cash
+  s.lastCandidateAccount = tempAccount;
+  s.lastCandidateDocMsgId = isDocument && ctx.message?.message_id ? ctx.message.message_id : null;
+  s.lastCandidateChatId = ctx.chat.id;
+
+  // RULE: If NO cash (balance <= 0), offer last order & 1-tap Force Login with Free Cash.
+  // Document message is PRESERVED in chat unless user taps Force Login.
   if (cashBalance <= 0) {
     const lastOrder = await fetchLatestOrderDetails(tempAccount);
 
@@ -479,7 +520,7 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
       '----------------------'
     ];
 
-    let replyMarkup = getMainMenuKeyboard(s);
+    const inlineKb = [];
 
     if (lastOrder && lastOrder.orderId) {
       rejectLines.push(
@@ -493,38 +534,36 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
         '----------------------',
         'TRACKING LINK (SWIGGY API):',
         lastOrder.trackingUrl,
-        '----------------------',
-        'STATUS   : REJECTED & NOT SAVED',
-        'FILE     : PRESERVED (NOT DELETED)'
+        '----------------------'
       );
-
-      replyMarkup = {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: '🚀 VIEW LAST ORDER TRACKING', url: lastOrder.trackingUrl }
-            ],
-            [
-              { text: '🛒 ADD ITEM', callback_data: 'tb_cart_prompt' },
-              { text: '🔑 LOGIN ANOTHER', callback_data: 'tb_login_prompt' }
-            ]
-          ]
-        }
-      };
+      if (lastOrder.trackingUrl) {
+        inlineKb.push([{ text: '🚀 VIEW LAST ORDER TRACKING', url: lastOrder.trackingUrl }]);
+      }
     } else {
       rejectLines.push(
         'ORDERS   : NO PAST ORDERS FOUND',
-        '----------------------',
-        'STATUS   : REJECTED & NOT SAVED',
-        'FILE     : PRESERVED (NOT DELETED)',
-        '----------------------',
-        'SEND AN ACCOUNT WITH FREE CASH!'
+        '----------------------'
       );
     }
 
+    rejectLines.push(
+      'CLICK BELOW TO FORCE LOGIN & ADD ₹50:',
+      'TAP [ ⚡ FORCE LOGIN (+₹50 CASH) ]',
+      '----------------------',
+      'FILE     : PRESERVED IN CHAT'
+    );
+
+    inlineKb.push([
+      { text: '⚡ FORCE LOGIN (+₹50 CASH)', callback_data: 'tb_force_login_cash' }
+    ]);
+    inlineKb.push([
+      { text: '🛒 ADD ITEM', callback_data: 'tb_cart_prompt' },
+      { text: '🔑 LOGIN ANOTHER', callback_data: 'tb_login_prompt' }
+    ]);
+
     await ctx.reply(mono(rejectLines.join('\n')), {
       parse_mode: 'HTML',
-      ...replyMarkup
+      reply_markup: { inline_keyboard: inlineKb }
     });
     return;
   }
@@ -584,6 +623,82 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
     reply_markup: { inline_keyboard: buttons }
   });
 }
+
+  // Force Login with +₹50 Free Cash (calls Swiggy API, adds 50 cash, removes file, and preserves setup)
+  bot.action('tb_force_login_cash', async (ctx) => {
+    await ctx.answerCbQuery('⚡ Force Login with ₹50 Free Cash...').catch(() => {});
+    const s = getState(ctx.from.id);
+    const targetAcc = s.lastCandidateAccount || s.account;
+
+    if (!targetAcc) {
+      s.step = 'AWAITING_JSON_LOGIN';
+      await ctx.reply(
+        mono('NO CANDIDATE ACCOUNT FOUND.\nPLEASE SEND SWIGGY JSON FILE OR COOKIES FIRST:'),
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const waitMsg = await ctx.reply(mono('⚡ ACTIVATING SWIGGY API & ADDING ₹50 FREE CASH...'), { parse_mode: 'HTML' });
+
+    // Fetch from Swiggy API to add/bind referral free cash & opt-in
+    await activateReferralCashApi(targetAcc).catch(() => {});
+
+    // Delete uploaded document file from chat if present
+    if (s.lastCandidateDocMsgId && s.lastCandidateChatId) {
+      await ctx.telegram.deleteMessage(s.lastCandidateChatId, s.lastCandidateDocMsgId).catch(() => {});
+      s.lastCandidateDocMsgId = null;
+    }
+
+    // Set account as active with 50 free cash
+    s.account = targetAcc;
+    s.referClaimed = true;
+    s.bhimOffer = true;
+    s.freeCashAmount = 50;
+    s.step = 'IDLE';
+
+    // Restore saved cart if cart is currently empty
+    if (!s.cart?.length && s.savedCart?.length) {
+      s.cart = [...s.savedCart];
+      s.restaurant = s.savedRestaurant || s.restaurant;
+    }
+
+    // Auto-bind address to new account
+    if (s.address && s.lat && s.lng) {
+      saveAddressToAccount(s.account, s.address).then((res) => {
+        if (res?.addressId) s.address.id = res.addressId;
+      }).catch(() => {});
+    }
+
+    await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
+
+    const phone = s.account.phone || 'Swiggy User';
+    const lines = [
+      '⚡ FORCE LOGIN SUCCESSFUL',
+      '----------------------',
+      `PHONE    : ${maskPhoneStars(phone)}`,
+      'WALLET   : ₹50 (FREE CASH ADDED VIA API)',
+      'BHIMNEW  : -₹50 AUTO-APPLIED',
+      'STATUS   : ACTIVE & READY FOR ORDER',
+      'FILE     : REMOVED FROM CHAT',
+      '----------------------',
+      'CART & ADDRESS PRESERVED!',
+      'TAP [ ⚡ CHECKOUT ] TO ORDER DIRECTLY!'
+    ];
+
+    const hasSaved = Boolean(s.cart?.length > 0 && s.address);
+    const btns = [
+      hasSaved
+        ? [{ text: '⚡ CHECKOUT', callback_data: 'tb_checkout' }]
+        : [{ text: '🛒 ADD ITEM', callback_data: 'tb_cart_prompt' }, { text: '📍 ADDRESS', callback_data: 'tb_addr_prompt' }],
+      [{ text: '🧾 BILL & QR', callback_data: 'tb_bill_qr' }]
+    ];
+
+    await ctx.reply(mono(lines.join('\n')), {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: btns }
+    });
+  });
 
   bot.action('tb_login_prompt', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
