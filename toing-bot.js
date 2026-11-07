@@ -55,6 +55,8 @@ export function getState(userId) {
       restaurant: null,
       menuData: null,
       cart: [],
+      savedCart: [],
+      savedRestaurant: null,
       liveCart: null,
       pendingOutlets: [],
       pendingDishes: [],
@@ -106,6 +108,7 @@ export function getMainMenuKeyboard(s) {
           { text: '🛒 ADD ITEM', callback_data: 'tb_cart_prompt' }
         ],
         [
+          { text: '⚡ CHECKOUT', callback_data: 'tb_checkout' },
           { text: '🧾 BILL & QR', callback_data: 'tb_bill_qr' }
         ]
       ]
@@ -138,13 +141,13 @@ async function claimSwiggyCash(account) {
     const walletBalance = Number(cm.user_swiggy_money || cm.swiggy_money || cm.user_swiggy_money_balance || cm.swiggy_pay_eligible_balance || 0);
 
     return {
-      success: true,
-      balance: walletBalance > 0 ? walletBalance : 50,
+      success: walletBalance > 0,
+      balance: walletBalance,
       realWallet: walletBalance,
-      message: '₹50 REFERRAL & PROMO CASH ACTIVATED'
+      message: walletBalance > 0 ? `₹${walletBalance} ACTIVE IN WALLET` : 'NO FREE CASH ON THIS ACCOUNT'
     };
   } catch (err) {
-    return { success: false, balance: 50, message: err.message };
+    return { success: false, balance: 0, realWallet: 0, message: err.message };
   }
 }
 
@@ -223,6 +226,64 @@ export async function searchRealMenuItems(restaurantId, itemQuery, lat = '26.865
   }
 }
 
+/**
+ * Fetches real-time order tracking details directly from Swiggy's official APIs.
+ */
+export async function fetchLiveOrderTrackingApi(account, orderId) {
+  const cleanId = String(orderId || '').replace(/\D/g, '') || String(orderId || '');
+  let statusText = 'ORDER CONFIRMED';
+  let etaText = '20-30 MINS';
+  let riderInfo = 'ASSIGNING PARTNER';
+  let trackingUrl = `https://www.swiggy.com/ofo/track/${cleanId}`;
+
+  if (account && cleanId) {
+    try {
+      const [trkRes, detRes] = await Promise.all([
+        dapiFetch(account, `order/trackV4?order_id=${encodeURIComponent(cleanId)}&type=full&version=V2`, { timeoutMs: 3500 }).catch(() => null),
+        dapiFetch(account, `order/details?order_id=${encodeURIComponent(cleanId)}&type=full&version=V2`, { timeoutMs: 3500 }).catch(() => null)
+      ]);
+
+      const trkData = trkRes?.json?.data || {};
+      const detOrder = detRes?.json?.data?.orders?.[0] || detRes?.json?.data?.order || {};
+
+      if (trkData?.sla_string || trkData?.delivery_sla) {
+        etaText = String(trkData.sla_string || trkData.delivery_sla || '').toUpperCase();
+      } else if (detOrder?.delivery_time_in_seconds) {
+        etaText = `${Math.ceil(detOrder.delivery_time_in_seconds / 60)} MINS`;
+      }
+
+      if (trkData?.status_title || trkData?.order_status) {
+        statusText = String(trkData.status_title || trkData.order_status || '').toUpperCase();
+      } else if (detOrder?.order_status || detOrder?.post_status) {
+        statusText = String(detOrder.order_status || detOrder.post_status || '').toUpperCase();
+      }
+
+      if (trkData?.delivery_executive?.name) {
+        const deName = trkData.delivery_executive.name;
+        const dePhone = trkData.delivery_executive.mobile || '';
+        riderInfo = `${deName}${dePhone ? ` (${dePhone})` : ''}`;
+      } else if (detOrder?.delivery_boy?.name) {
+        riderInfo = String(detOrder.delivery_boy.name);
+      }
+
+      const extractedShare = trkData?.share_url || trkData?.share_link || trkData?.order_share_url || detOrder?.share_url || '';
+      if (extractedShare && String(extractedShare).startsWith('http')) {
+        trackingUrl = extractedShare;
+      }
+    } catch (e) {
+      console.warn('[fetchLiveOrderTrackingApi error]', e.message);
+    }
+  }
+
+  return {
+    orderId: cleanId,
+    statusText,
+    etaText,
+    riderInfo,
+    trackingUrl
+  };
+}
+
 export function setupToingBot(bot) {
   // 1. /start
   bot.command('start', async (ctx) => {
@@ -235,6 +296,109 @@ export function setupToingBot(bot) {
   });
 
   // 2. Login Prompt
+  /**
+ * Validates new account for free cash. If no cash -> rejects and keeps file.
+ * If cash exists -> deletes file from chat, accepts account, and enables 1-tap checkout.
+ */
+async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument = false) {
+  const s = getState(ctx.from.id);
+  const normalized = normalizeSwiggySessionPayload(rawParsed);
+  const phone = normalized?.phone || normalized?.mobile || rawParsed?.phone || 'Swiggy User';
+
+  const checkingMsg = await ctx.reply(mono(`CHECKING FREE CASH FOR ${maskPhoneStars(phone)}...`), { parse_mode: 'HTML' });
+
+  const tempAccount = {
+    ...normalized,
+    phone,
+    cookies: normalized?.cookies || '',
+    tid: normalized?.tid || '',
+    token: normalized?.token || '',
+    _session_tid: normalized?._session_tid || '',
+    sid: normalized?.sid || '',
+    deviceId: normalized?.deviceId || '',
+    isLoggedIn: true
+  };
+
+  const claimRes = await claimSwiggyCash(tempAccount);
+  await ctx.telegram.deleteMessage(ctx.chat.id, checkingMsg.message_id).catch(() => {});
+
+  const cashBalance = Number(claimRes?.realWallet ?? claimRes?.balance ?? 0);
+
+  // RULE: If NO cash (balance <= 0), REJECT account! Document message is preserved (NOT deleted).
+  if (cashBalance <= 0) {
+    const rejectLines = [
+      'ACCOUNT REJECTED (NO FREE CASH)',
+      '----------------------',
+      `PHONE  : ${maskPhoneStars(phone)}`,
+      'WALLET : ₹0 (NO CASH DETECTED)',
+      'STATUS : REJECTED & NOT SAVED',
+      'FILE   : PRESERVED (NOT DELETED)',
+      '----------------------',
+      'SEND AN ACCOUNT WITH FREE CASH!'
+    ];
+    await ctx.reply(mono(rejectLines.join('\n')), {
+      parse_mode: 'HTML',
+      ...getMainMenuKeyboard(s)
+    });
+    return;
+  }
+
+  // RULE: Account HAS cash -> delete file from Telegram chat for security
+  if (isDocument && ctx.message?.message_id) {
+    await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+  }
+
+  s.account = tempAccount;
+  s.referClaimed = true;
+  s.bhimOffer = true;
+  s.freeCashAmount = cashBalance;
+  s.step = 'IDLE';
+
+  // Restore saved cart if cart was empty
+  if (!s.cart?.length && s.savedCart?.length) {
+    s.cart = [...s.savedCart];
+    s.restaurant = s.savedRestaurant || s.restaurant;
+  }
+
+  // Auto-bind saved address to this new account immediately
+  if (s.address && s.lat && s.lng) {
+    saveAddressToAccount(s.account, s.address).then((res) => {
+      if (res?.addressId) s.address.id = res.addressId;
+    }).catch(() => {});
+  }
+
+  const hasSavedSetup = Boolean(s.cart?.length > 0 && s.address);
+
+  const acceptLines = [
+    'ACCOUNT ACCEPTED (FREE CASH ACTIVE)',
+    '----------------------',
+    `PHONE  : ${maskPhoneStars(phone)}`,
+    `WALLET : ₹${cashBalance} ACTIVE`,
+    'STATUS : READY FOR CHECKOUT',
+    `FILE   : ${isDocument ? 'DELETED (SECURE)' : 'VERIFIED'}`,
+    '----------------------'
+  ];
+
+  if (hasSavedSetup) {
+    acceptLines.push('SAVED CART & ADDRESS READY!');
+    acceptLines.push('CLICK [ ⚡ CHECKOUT ] TO ORDER DIRECTLY:');
+  } else {
+    acceptLines.push('NEXT: SET ADDRESS & ADD ITEMS ONCE.');
+  }
+
+  const buttons = [
+    hasSavedSetup
+      ? [{ text: '⚡ CHECKOUT', callback_data: 'tb_checkout' }]
+      : [{ text: '🛒 ADD ITEM', callback_data: 'tb_cart_prompt' }, { text: '📍 ADDRESS', callback_data: 'tb_addr_prompt' }],
+    [{ text: '🧾 BILL & QR', callback_data: 'tb_bill_qr' }]
+  ];
+
+  await ctx.reply(mono(acceptLines.join('\n')), {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
   bot.action('tb_login_prompt', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const s = getState(ctx.from.id);
@@ -336,6 +500,51 @@ export function setupToingBot(bot) {
   });
 
   // 7. Bill & QR (Fetches Detailed Genuine Swiggy Live Bill)
+    // 6b. 1-Tap Checkout: Retains saved items & address across multiple accounts!
+  bot.action('tb_checkout', async (ctx) => {
+    await ctx.answerCbQuery('Starting 1-Tap Checkout...').catch(() => {});
+    const s = getState(ctx.from.id);
+
+    if (!s.account || !s.account.isLoggedIn) {
+      await ctx.reply(
+        mono('LOGIN REQUIRED\n----------------------\nPLEASE SEND SWIGGY JSON ACCOUNT FIRST:\n(ACCOUNT MUST HAVE FREE CASH)\n----------------------'),
+        { parse_mode: 'HTML', ...getMainMenuKeyboard(s) }
+      );
+      return;
+    }
+
+    if (!s.cart?.length && s.savedCart?.length) {
+      s.cart = [...s.savedCart];
+      s.restaurant = s.savedRestaurant || s.restaurant;
+    }
+
+    if (!s.cart?.length) {
+      s.step = 'AWAITING_REST_NAME';
+      await ctx.reply(
+        mono('CART IS EMPTY\n----------------------\nPLEASE ENTER RESTAURANT NAME TO ADD ITEMS ONCE:\n(WILL BE SAVED FOR ALL ACCOUNTS!)\n----------------------'),
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    if (!s.address || !s.lat || !s.lng) {
+      s.step = 'AWAITING_ADDRESS_LINK';
+      await ctx.reply(
+        mono('ADDRESS NOT SET\n----------------------\nPLEASE SEND SWIGGY ADDRESS LINK ONCE:\n(WILL BE SAVED FOR ALL ACCOUNTS!)\n----------------------'),
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    // Preserve saved cart & restaurant for subsequent accounts
+    s.savedCart = [...s.cart];
+    s.savedRestaurant = s.restaurant;
+
+    // Trigger bill & QR generation directly
+    await ctx.telegram.sendMessage(ctx.chat.id, mono('LOADING 1-TAP CHECKOUT BILL...'), { parse_mode: 'HTML' });
+    return executeToingBillAndQr(ctx, s);
+  });
+
   bot.action('tb_bill_qr', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const s = getState(ctx.from.id);
@@ -729,22 +938,36 @@ export function setupToingBot(bot) {
     }
   });
 
-  // 9. Paid Confirmation
+  // 9. Paid Confirmation with API-fetched Live Tracking
   bot.action(/^tb_paid_(.+)$/, async (ctx) => {
     const orderId = ctx.match[1];
-    await ctx.answerCbQuery('Payment verified!').catch(() => {});
+    await ctx.answerCbQuery('Fetching live tracking from Swiggy API...').catch(() => {});
     const s = getState(ctx.from.id);
 
     try {
       await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
     } catch (_) {}
 
+    const waitMsg = await ctx.reply(mono('CONNECTING TO SWIGGY API & FETCHING TRACKING...'), { parse_mode: 'HTML' });
+    const trackInfo = await fetchLiveOrderTrackingApi(s.account, orderId);
+    await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
+
+    // Preserve cart & restaurant in savedCart so user can 1-tap checkout again on next account!
+    if (s.cart?.length) {
+      s.savedCart = [...s.cart];
+      s.savedRestaurant = s.restaurant;
+    }
+
     const lines = [
-      'ORDER PLACED SUCCESSFULLY!',
+      'ORDER PLACED & TRACKING LIVE',
       '----------------------',
-      `ORDER ID : #${orderId}`,
-      'STATUS   : CONFIRMED',
-      'DELIVERY : 30-40 MINS',
+      `ORDER ID : #${trackInfo.orderId}`,
+      `STATUS   : ${trackInfo.statusText}`,
+      `ETA      : ${trackInfo.etaText}`,
+      `RIDER    : ${trackInfo.riderInfo}`,
+      '----------------------',
+      'TRACKING LINK (SWIGGY API):',
+      trackInfo.trackingUrl,
       '----------------------',
       'THANK YOU FOR CHOOSING TOING!'
     ];
@@ -754,14 +977,86 @@ export function setupToingBot(bot) {
       reply_markup: {
         inline_keyboard: [
           [
-            { text: '🚀 TRACK ORDER', url: `https://www.swiggy.com/ofo/track/${orderId}` }
+            { text: '🚀 LIVE TRACKING', url: trackInfo.trackingUrl },
+            { text: '🔄 REFRESH STATUS', callback_data: `tb_track_${orderId}` }
+          ],
+          [
+            { text: '⚡ CHECKOUT NEXT ACCOUNT', callback_data: 'tb_checkout' }
           ]
         ]
       }
     });
 
-    s.cart = [];
     s.step = 'IDLE';
+  });
+
+  // Live Tracking Refresh via Swiggy API
+  bot.action(/^tb_track_(.+)$/, async (ctx) => {
+    const orderId = ctx.match[1];
+    await ctx.answerCbQuery('Refreshing live tracking...').catch(() => {});
+    const s = getState(ctx.from.id);
+
+    const trackInfo = await fetchLiveOrderTrackingApi(s.account, orderId);
+
+    const lines = [
+      'LIVE ORDER STATUS (SWIGGY API)',
+      '----------------------',
+      `ORDER ID : #${trackInfo.orderId}`,
+      `STATUS   : ${trackInfo.statusText}`,
+      `ETA      : ${trackInfo.etaText}`,
+      `RIDER    : ${trackInfo.riderInfo}`,
+      '----------------------',
+      'TRACKING LINK (SWIGGY API):',
+      trackInfo.trackingUrl,
+      '----------------------',
+      `LAST UPDATED: ${new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+    ];
+
+    await ctx.reply(mono(lines.join('\n')), {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '🚀 LIVE TRACKING', url: trackInfo.trackingUrl },
+            { text: '🔄 REFRESH STATUS', callback_data: `tb_track_${orderId}` }
+          ]
+        ]
+      }
+    });
+  });
+
+  // /track command to fetch tracking for any order via API
+  bot.command('track', async (ctx) => {
+    const parts = (ctx.message?.text || '').split(/\s+/);
+    const s = getState(ctx.from.id);
+    const orderId = parts[1] || s.currentOrderId;
+    if (!orderId) {
+      await ctx.reply(mono('PLEASE SPECIFY ORDER ID:\nUSAGE: /track <order_id>'), { parse_mode: 'HTML' });
+      return;
+    }
+    const trackInfo = await fetchLiveOrderTrackingApi(s.account, orderId);
+    const lines = [
+      'LIVE ORDER TRACKING (SWIGGY API)',
+      '----------------------',
+      `ORDER ID : #${trackInfo.orderId}`,
+      `STATUS   : ${trackInfo.statusText}`,
+      `ETA      : ${trackInfo.etaText}`,
+      `RIDER    : ${trackInfo.riderInfo}`,
+      '----------------------',
+      'TRACKING LINK (SWIGGY API):',
+      trackInfo.trackingUrl
+    ];
+    await ctx.reply(mono(lines.join('\n')), {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '🚀 LIVE TRACKING', url: trackInfo.trackingUrl },
+            { text: '🔄 REFRESH STATUS', callback_data: `tb_track_${orderId}` }
+          ]
+        ]
+      }
+    });
   });
 
   // Clear cart / cancel
@@ -905,11 +1200,10 @@ export function setupToingBot(bot) {
     });
   });
 
-  // 10. Document Handler (Login with JSON file)
+  // 10. Document Handler (Login with JSON file — with Free Cash verification)
   bot.on('document', async (ctx) => {
     const doc = ctx.message?.document;
     if (!doc) return;
-    const s = getState(ctx.from.id);
 
     try {
       const link = await ctx.telegram.getFileLink(doc.file_id);
@@ -922,34 +1216,7 @@ export function setupToingBot(bot) {
         await ctx.reply(mono('INVALID JSON FILE FORMAT'), { parse_mode: 'HTML' });
         return;
       }
-
-      const normalized = normalizeSwiggySessionPayload(parsed);
-      const phone = normalized?.phone || normalized?.mobile || parsed?.phone || 'Swiggy User';
-
-      s.account = {
-        ...normalized,
-        phone,
-        cookies: normalized?.cookies || '',
-        tid: normalized?.tid || '',
-        token: normalized?.token || '',
-        _session_tid: normalized?._session_tid || '',
-        sid: normalized?.sid || '',
-        deviceId: normalized?.deviceId || '',
-        isLoggedIn: true
-      };
-      s.step = 'IDLE';
-
-      const lines = [
-        'LOGIN SUCCESSFUL',
-        '----------------------',
-        `PHONE  : ${maskPhoneStars(phone)}`,
-        'STATUS : ACTIVE',
-        '----------------------'
-      ];
-      await ctx.reply(mono(lines.join('\n')), {
-        parse_mode: 'HTML',
-        ...getMainMenuKeyboard(s)
-      });
+      await processAccountLoginWithFreeCashCheck(ctx, parsed, true);
     } catch (err) {
       await ctx.reply(mono(`LOGIN ERROR: ${err.message}`), { parse_mode: 'HTML' });
     }
@@ -966,32 +1233,7 @@ export function setupToingBot(bot) {
     if (s.step === 'AWAITING_JSON_LOGIN' || (text.startsWith('{') && text.endsWith('}'))) {
       try {
         const parsed = JSON.parse(text);
-        const normalized = normalizeSwiggySessionPayload(parsed);
-        const phone = normalized?.phone || normalized?.mobile || parsed?.phone || 'Swiggy User';
-        s.account = {
-          ...normalized,
-          phone,
-          cookies: normalized?.cookies || '',
-          tid: normalized?.tid || '',
-          token: normalized?.token || '',
-          _session_tid: normalized?._session_tid || '',
-          sid: normalized?.sid || '',
-          deviceId: normalized?.deviceId || '',
-          isLoggedIn: true
-        };
-        s.step = 'IDLE';
-
-        const lines = [
-          'LOGIN SUCCESSFUL',
-          '----------------------',
-          `PHONE  : ${maskPhoneStars(phone)}`,
-          'STATUS : ACTIVE',
-          '----------------------'
-        ];
-        await ctx.reply(mono(lines.join('\n')), {
-          parse_mode: 'HTML',
-          ...getMainMenuKeyboard(s)
-        });
+        await processAccountLoginWithFreeCashCheck(ctx, parsed, false);
         return;
       } catch (_) {}
     }
