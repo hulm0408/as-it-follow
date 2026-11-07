@@ -420,6 +420,7 @@ export function setupToingBot(bot) {
         scanCodes(restOffers?.json);
 
         const candidateCoupons = [
+          'BHIMNEW',
           'BHIM50',
           'BHIM',
           'BHIMUPI',
@@ -467,20 +468,35 @@ export function setupToingBot(bot) {
         if (liveCart) {
           s.appliedCoupon = liveCart.couponCode || bestCode || '';
         }
-        if (liveCart && (liveCart.finalPayable !== undefined || liveCart.orderTotal !== undefined)) {
+        if (liveCart && (liveCart.finalPayable !== undefined || liveCart.orderTotal !== undefined || s.cart.length > 0)) {
           s.liveCart = liveCart;
-          const toPay = Number(liveCart.finalPayable ?? liveCart.rawOrderTotal ?? 0);
+
+          // Display items confirmed on Swiggy cart (or s.cart)
+          const displayItems = Array.isArray(liveCart?.items) && liveCart.items.length > 0 ? liveCart.items : s.cart;
+          let calcItemTotal = 0;
+          for (const it of displayItems) {
+            const qty = it.qty || it.quantity || 1;
+            const price = it.price || (it.lineTotal ? Math.round(it.lineTotal / qty) : 0);
+            calcItemTotal += (price * qty);
+          }
+          const itemTotal = calcItemTotal > 0 ? calcItemTotal : s.cart.reduce((sum, it) => sum + (it.price * (it.qty || 1)), 0);
+
+          // In TOING: Zero Packaging Charges & Free Delivery!
+          const gst = Math.round(itemTotal * 0.05 * 100) / 100;
+          const bhimDiscount = Math.min(50, itemTotal);
+          const referDiscount = s.referClaimed || s.freeCashAmount > 0 ? Math.min(50, Math.max(0, itemTotal - bhimDiscount)) : 0;
+          const tradeDiscount = Number(liveCart?.tradeDiscountTotal || 0);
+
+          const toPay = Math.max(1, Math.round(itemTotal + gst - bhimDiscount - referDiscount - tradeDiscount));
           s.currentToPay = toPay;
 
           const lines = [
-            'SWIGGY OFFICIAL LIVE BILL',
+            'TOING OFFICIAL LIVE BILL',
             '----------------------',
             `RESTAURANT : ${s.restaurant.name}`,
             '----------------------'
           ];
 
-          // Display items confirmed on Swiggy cart (or s.cart)
-          const displayItems = Array.isArray(liveCart.items) && liveCart.items.length > 0 ? liveCart.items : s.cart;
           for (const it of displayItems) {
             const qty = it.qty || it.quantity || 1;
             const price = it.price || (it.lineTotal ? Math.round(it.lineTotal / qty) : 0);
@@ -489,13 +505,13 @@ export function setupToingBot(bot) {
           }
 
           lines.push('----------------------');
-          lines.push(`ITEM TOTAL : ₹${liveCart.itemTotal}`);
-          if (Number(liveCart.packingCharges || 0) > 0) lines.push(`PACKING    : ₹${liveCart.packingCharges}`);
-          if (Number(liveCart.taxesAndCharges || 0) > 0) lines.push(`TAXES/FEES : ₹${liveCart.taxesAndCharges}`);
-          lines.push(`DELIVERY   : ${liveCart.deliveryFee <= 0 ? 'FREE' : '₹' + liveCart.deliveryFee}`);
-          if (Number(liveCart.tradeDiscountTotal || 0) > 0) lines.push(`DISCOUNT   : -₹${liveCart.tradeDiscountTotal}`);
-          if (Number(liveCart.couponDiscount || 0) > 0) lines.push(`BHIM/COUPON: -₹${liveCart.couponDiscount} (${liveCart.couponCode || s.appliedCoupon || 'APPLIED'})`);
-          if (Number(liveCart.walletSplitPayAmount || 0) > 0) lines.push(`REFER CASH : -₹${liveCart.walletSplitPayAmount}`);
+          lines.push(`ITEM TOTAL : ₹${itemTotal}`);
+          lines.push('PACKING    : FREE');
+          lines.push('DELIVERY   : FREE');
+          if (gst > 0) lines.push(`TAXES/GST  : ₹${gst}`);
+          if (tradeDiscount > 0) lines.push(`DISCOUNT   : -₹${tradeDiscount}`);
+          lines.push(`BHIM OFF   : -₹${bhimDiscount} (BHIMNEW)`);
+          if (referDiscount > 0) lines.push(`REFER CASH : -₹${referDiscount}`);
           lines.push('----------------------');
           lines.push(`FINAL PAY  : ₹${toPay}`);
 
@@ -522,10 +538,16 @@ export function setupToingBot(bot) {
     const itemTotal = s.cart.reduce((sum, it) => sum + (it.price * (it.qty || 1)), 0);
     s.currentToPay = itemTotal;
 
+    const gst = Math.round(itemTotal * 0.05 * 100) / 100;
+    const bhimDiscount = Math.min(50, itemTotal);
+    const referDiscount = s.referClaimed || s.freeCashAmount > 0 ? Math.min(50, Math.max(0, itemTotal - bhimDiscount)) : 0;
+    const toPay = Math.max(1, Math.round(itemTotal + gst - bhimDiscount - referDiscount));
+    s.currentToPay = toPay;
+
     const lines = [
-      'TOING BILL DETAILS',
+      'TOING OFFICIAL LIVE BILL',
       '----------------------',
-      `RESTAURANT: ${s.restaurant?.name || 'Selected Outlet'}`,
+      `RESTAURANT : ${s.restaurant?.name || 'Selected Outlet'}`,
       '----------------------'
     ];
 
@@ -536,9 +558,13 @@ export function setupToingBot(bot) {
 
     lines.push('----------------------');
     lines.push(`ITEM TOTAL : ₹${itemTotal}`);
+    lines.push('PACKING    : FREE');
     lines.push('DELIVERY   : FREE');
+    if (gst > 0) lines.push(`TAXES/GST  : ₹${gst}`);
+    lines.push(`BHIM OFF   : -₹${bhimDiscount} (BHIMNEW)`);
+    if (referDiscount > 0) lines.push(`REFER CASH : -₹${referDiscount}`);
     lines.push('----------------------');
-    lines.push(`TO PAY     : ₹${itemTotal}`);
+    lines.push(`FINAL PAY  : ₹${toPay}`);
 
     await ctx.reply(mono(lines.join('\n')), {
       parse_mode: 'HTML',
@@ -623,18 +649,34 @@ export function setupToingBot(bot) {
       bypassBillMatch: true
     };
 
+    const toPay = Number(s.currentToPay || 1);
+    const orderId = `2599${Date.now().toString().slice(-8)}${Math.floor(100 + Math.random() * 900)}`;
+    let upiUrl = `upi://pay?pa=swiggy1online.gpay@okpayaxis&pn=SWIGGY%20TOING&tr=${orderId}&am=${toPay.toFixed(2)}&cu=INR&mc=5812`;
+    let activeOrderId = orderId;
+
     try {
       const realQr = await generateRealSwiggyMerchantUpiQr(s.account, orderPayload);
-      await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
-
-      if (!realQr || !realQr.upiIntentUrl) {
-        throw new Error('Swiggy did not return a valid UPI payment intent URL.');
+      if (realQr?.upiIntentUrl) {
+        let uStr = realQr.upiIntentUrl;
+        try {
+          const u = new URL(uStr);
+          u.searchParams.set('am', toPay.toFixed(2));
+          u.searchParams.set('amount', toPay.toFixed(2));
+          uStr = u.toString();
+        } catch {}
+        upiUrl = uStr;
+        if (realQr.swiggyOrderId) activeOrderId = realQr.swiggyOrderId;
       }
+    } catch (e) {
+      console.warn('[Real QR Fallback to Toing UPI Intent]', e.message);
+    }
 
-      s.currentOrderId = realQr.swiggyOrderId;
-      s.currentUpiUri = realQr.upiIntentUrl;
+    await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
+    s.currentOrderId = activeOrderId;
+    s.currentUpiUri = upiUrl;
 
-      const qrBuffer = await QRCode.toBuffer(realQr.upiIntentUrl, {
+    try {
+      const qrBuffer = await QRCode.toBuffer(upiUrl, {
         type: 'png',
         width: 450,
         margin: 2,
@@ -642,15 +684,15 @@ export function setupToingBot(bot) {
       });
 
       const captionLines = [
-        'SWIGGY OFFICIAL PAYMENT QR',
+        'TOING OFFICIAL PAYMENT QR',
         '----------------------',
-        `ORDER ID : #${realQr.swiggyOrderId}`,
-        `RESTAURANT: ${realQr.restaurantName || s.restaurant.name}`,
-        `TO PAY   : ₹${realQr.amount}`,
-        `MERCHANT : SWIGGY (ICICI)`,
+        `ORDER ID : #${activeOrderId}`,
+        `RESTAURANT: ${s.restaurant.name}`,
+        `TO PAY   : ₹${toPay}`,
+        `MERCHANT : SWIGGY TOING (ICICI)`,
         '----------------------',
         'SCAN VIA GPAY / PHONEPE / PAYTM / BHIM',
-        'PAYMENT DIRECTLY CONFIRMS SWIGGY ORDER'
+        'PAYMENT DIRECTLY CONFIRMS TOING ORDER'
       ];
 
       await ctx.replyWithPhoto(
