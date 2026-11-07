@@ -119,32 +119,95 @@ export function getMainMenuKeyboard(s) {
 /**
  * Pure-HTTP fast claim for Swiggy Referral Free Cash & Swiggy Money inspection.
  */
-async function claimSwiggyCash(account) {
-  if (!account) return { success: false, balance: 0, message: 'NO ACCOUNT LOGGED IN' };
+/**
+ * Pure-HTTP multi-source live inspector for Swiggy Referral Free Cash & Swiggy Money.
+ * Deeply checks uploaded payload, opt-in, campaigns, user/swiggy-money, user/profile, and cartMeta.
+ */
+async function claimSwiggyCash(account, rawParsed = null) {
+  if (!account) return { success: false, balance: 0, realWallet: 0, message: 'NO ACCOUNT LOGGED IN' };
   try {
+    let maxFound = 0;
+    const inspectObj = (obj) => {
+      if (!obj || typeof obj !== 'object') return 0;
+      const candidates = [
+        obj.user_swiggy_money,
+        obj.swiggy_money,
+        obj.swiggy_pay_eligible_balance,
+        obj.user_swiggy_money_balance,
+        obj.freeCashBalance,
+        obj.freeCash,
+        obj.free_cash,
+        obj.walletBalance,
+        obj.wallet_balance,
+        obj.total_balance,
+        obj.balance,
+        obj.cash,
+        obj.swiggyMoney
+      ];
+      let best = 0;
+      for (const c of candidates) {
+        const val = Number(c);
+        if (Number.isFinite(val) && val > best) best = val;
+      }
+      return best;
+    };
+
+    // 0. Inspect raw upload payload & account object
+    maxFound = Math.max(
+      maxFound,
+      inspectObj(rawParsed),
+      inspectObj(rawParsed?.data),
+      inspectObj(rawParsed?.wallet),
+      inspectObj(rawParsed?.profile),
+      inspectObj(rawParsed?.session),
+      inspectObj(account)
+    );
+
     // 1. Claim Swiggy event rewards (Breakfast & Late Night / Free Cash)
     await claimSwiggyBreakfastAndLateNightOffers(account, { force: true, offerValue: 1 }).catch(() => null);
 
-    // 2. Trigger Swiggy Money Opt-in and Reward Claim campaigns
-    await dapiFetch(account, 'user/swiggy-money/opt-in', { method: 'POST', body: {} }).catch(() => {});
-    await dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'referral_free_cash' } }).catch(() => {});
-    await dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'food_free_cash' } }).catch(() => {});
-    await dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'instamart_free_cash' } }).catch(() => {});
-    await dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'new_user_free_cash' } }).catch(() => {});
+    // 2. Trigger Swiggy Money Opt-in and Reward Claim campaigns in parallel
+    await Promise.all([
+      dapiFetch(account, 'user/swiggy-money/opt-in', { method: 'POST', body: {} }).catch(() => {}),
+      dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'referral_free_cash' } }).catch(() => {}),
+      dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'food_free_cash' } }).catch(() => {}),
+      dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'instamart_free_cash' } }).catch(() => {}),
+      dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'new_user_free_cash' } }).catch(() => {}),
+      dapiFetch(account, 'rewards/claim', { method: 'POST', body: { campaign: 'swiggy_cash' } }).catch(() => {}),
+      dapiFetch(account, 'cart/apply-swiggy-money', { method: 'POST', body: { apply: true } }).catch(() => {})
+    ]);
 
-    // 3. Enable Swiggy Money auto-apply on cart
-    await dapiFetch(account, 'cart/apply-swiggy-money', { method: 'POST', body: { apply: true } }).catch(() => {});
+    // 3. Multi-source wallet & profile queries to reliably discover ALL cash across APIs
+    const [swiggyMoneyRes, profileRes, profInfoRes, cartRes, rewardsRes] = await Promise.all([
+      dapiFetch(account, 'user/swiggy-money', { timeoutMs: 5000 }).catch(() => null),
+      dapiFetch(account, 'user/profile', { timeoutMs: 5000 }).catch(() => null),
+      dapiFetch(account, 'profile/info', { timeoutMs: 5000 }).catch(() => null),
+      dapiFetch(account, 'cart', { timeoutMs: 5000 }).catch(() => null),
+      dapiFetch(account, 'rewards/user-summary', { timeoutMs: 5000 }).catch(() => null)
+    ]);
 
-    // 4. Fetch live cart to inspect real Swiggy Money / Wallet Free Cash balance
-    const cartRes = await dapiFetch(account, 'cart', { timeoutMs: 7000 }).catch(() => null);
+    // Inspect user/swiggy-money response
+    const smData = swiggyMoneyRes?.json?.data || swiggyMoneyRes?.json || {};
+    maxFound = Math.max(maxFound, inspectObj(smData), inspectObj(smData?.wallet), inspectObj(smData?.data));
+
+    // Inspect user/profile & profile/info response
+    const pData = profileRes?.json?.data || profileRes?.json || {};
+    const piData = profInfoRes?.json?.data || profInfoRes?.json || {};
+    maxFound = Math.max(maxFound, inspectObj(pData), inspectObj(pData?.profile), inspectObj(piData));
+
+    // Inspect cart response (cartMeta)
     const cm = cartRes?.json?.data?.cartMeta || cartRes?.json?.data || {};
-    const walletBalance = Number(cm.user_swiggy_money || cm.swiggy_money || cm.user_swiggy_money_balance || cm.swiggy_pay_eligible_balance || 0);
+    maxFound = Math.max(maxFound, inspectObj(cm));
+
+    // Inspect rewards/user-summary response
+    const rwData = rewardsRes?.json?.data || rewardsRes?.json || {};
+    maxFound = Math.max(maxFound, inspectObj(rwData));
 
     return {
-      success: walletBalance > 0,
-      balance: walletBalance,
-      realWallet: walletBalance,
-      message: walletBalance > 0 ? `₹${walletBalance} ACTIVE IN WALLET` : 'NO FREE CASH ON THIS ACCOUNT'
+      success: maxFound > 0,
+      balance: maxFound,
+      realWallet: maxFound,
+      message: maxFound > 0 ? `₹${maxFound} ACTIVE IN WALLET` : 'NO FREE CASH ON THIS ACCOUNT'
     };
   } catch (err) {
     return { success: false, balance: 0, realWallet: 0, message: err.message };
@@ -229,6 +292,85 @@ export async function searchRealMenuItems(restaurantId, itemQuery, lat = '26.865
 /**
  * Fetches real-time order tracking details directly from Swiggy's official APIs.
  */
+/**
+ * Fetches latest past order details for an account across Food, Instamart, Genie, Dineout.
+ */
+export async function fetchLatestOrderDetails(account) {
+  if (!account) return null;
+  try {
+    const [foodRes, imRes, genieRes, dineRes] = await Promise.all([
+      dapiFetch(account, 'order/all', { timeoutMs: 6000 }).catch(() => null),
+      dapiFetch(account, 'order/all?order_id=&deliveryType=INSTAMART', { timeoutMs: 6000 }).catch(() => null),
+      dapiFetch(account, 'order/all?order_id=&deliveryType=GENIE', { timeoutMs: 6000 }).catch(() => null),
+      dapiFetch(account, 'order/all?order_id=&deliveryType=DINEOUT', { timeoutMs: 6000 }).catch(() => null)
+    ]);
+
+    const allOrders = [];
+    const extract = (res) => {
+      const list = Array.isArray(res?.json?.data?.orders) ? res.json.data.orders : [];
+      for (const o of list) {
+        if (!o) continue;
+        const id = o.order_id || o.id;
+        if (id) allOrders.push(o);
+      }
+    };
+    extract(foodRes);
+    extract(imRes);
+    extract(genieRes);
+    extract(dineRes);
+
+    if (allOrders.length === 0) return null;
+
+    allOrders.sort((a, b) => {
+      const tA = Number(a.order_time_in_epoch || a.order_time || 0) || new Date(a.order_date || a.created_at || 0).getTime() || 0;
+      const tB = Number(b.order_time_in_epoch || b.order_time || 0) || new Date(b.order_date || b.created_at || 0).getTime() || 0;
+      return tB - tA;
+    });
+
+    const latest = allOrders[0];
+    const orderId = String(latest.order_id || latest.id || '').replace(/\D/g, '') || String(latest.order_id || latest.id);
+    const outlet = String(latest.restaurant_name || latest.outlet_name || latest.restaurant_details?.name || latest.delivery_type || 'Swiggy Outlet').trim();
+    const total = Number(latest.order_total || latest.order_total_amount || latest.net_total || latest.orderTotal || 0);
+    const status = String(latest.order_status || latest.post_status || latest.order_status_title || 'CONFIRMED').toUpperCase();
+
+    const rawItems = Array.isArray(latest.order_items) ? latest.order_items : (Array.isArray(latest.items) ? latest.items : []);
+    const itemNames = rawItems.map(it => {
+      const name = String(it.name || it.item_name || 'Item').trim();
+      const qty = Number(it.quantity || it.qty || 1);
+      return qty > 1 ? `${name} × ${qty}` : name;
+    }).slice(0, 3);
+    const itemsSummary = itemNames.length > 0 ? itemNames.join(', ') : 'Food / Grocery Order';
+
+    let dateStr = 'RECENT';
+    try {
+      const epoch = Number(latest.order_time_in_epoch || latest.order_time);
+      if (epoch) {
+        const d = new Date(epoch > 1e11 ? epoch : epoch * 1000);
+        dateStr = d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
+      } else if (latest.order_date || latest.created_at) {
+        const d = new Date(latest.order_date || latest.created_at);
+        dateStr = d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
+      }
+    } catch (_) {}
+
+    const liveTracking = await fetchLiveOrderTrackingApi(account, orderId);
+
+    return {
+      orderId,
+      outlet,
+      total,
+      status: liveTracking?.statusText || status,
+      date: dateStr,
+      items: itemsSummary,
+      trackingUrl: liveTracking?.trackingUrl || `https://www.swiggy.com/ofo/track/${orderId}`,
+      riderInfo: liveTracking?.riderInfo || 'N/A'
+    };
+  } catch (err) {
+    console.warn('[fetchLatestOrderDetails error]', err.message);
+    return null;
+  }
+}
+
 export async function fetchLiveOrderTrackingApi(account, orderId) {
   const cleanId = String(orderId || '').replace(/\D/g, '') || String(orderId || '');
   let statusText = 'ORDER CONFIRMED';
@@ -305,7 +447,7 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
   const normalized = normalizeSwiggySessionPayload(rawParsed);
   const phone = normalized?.phone || normalized?.mobile || rawParsed?.phone || 'Swiggy User';
 
-  const checkingMsg = await ctx.reply(mono(`CHECKING FREE CASH FOR ${maskPhoneStars(phone)}...`), { parse_mode: 'HTML' });
+  const checkingMsg = await ctx.reply(mono(`CHECKING FREE CASH & ORDERS FOR ${maskPhoneStars(phone)}...`), { parse_mode: 'HTML' });
 
   const tempAccount = {
     ...normalized,
@@ -319,26 +461,70 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
     isLoggedIn: true
   };
 
-  const claimRes = await claimSwiggyCash(tempAccount);
+  const claimRes = await claimSwiggyCash(tempAccount, rawParsed);
   await ctx.telegram.deleteMessage(ctx.chat.id, checkingMsg.message_id).catch(() => {});
 
   const cashBalance = Number(claimRes?.realWallet ?? claimRes?.balance ?? 0);
 
-  // RULE: If NO cash (balance <= 0), REJECT account! Document message is preserved (NOT deleted).
+  // RULE: If NO cash (balance <= 0), REJECT account!
+  // Fetch latest order details if any exist on Swiggy. Document message is PRESERVED (NOT deleted).
   if (cashBalance <= 0) {
+    const lastOrder = await fetchLatestOrderDetails(tempAccount);
+
     const rejectLines = [
       'ACCOUNT REJECTED (NO FREE CASH)',
       '----------------------',
-      `PHONE  : ${maskPhoneStars(phone)}`,
-      'WALLET : ₹0 (NO CASH DETECTED)',
-      'STATUS : REJECTED & NOT SAVED',
-      'FILE   : PRESERVED (NOT DELETED)',
-      '----------------------',
-      'SEND AN ACCOUNT WITH FREE CASH!'
+      `PHONE    : ${maskPhoneStars(phone)}`,
+      'WALLET   : ₹0 (NO CASH DETECTED)',
+      '----------------------'
     ];
+
+    let replyMarkup = getMainMenuKeyboard(s);
+
+    if (lastOrder && lastOrder.orderId) {
+      rejectLines.push(
+        'LAST ORDER DETAILS (LIVE API):',
+        `ORDER ID : #${lastOrder.orderId}`,
+        `OUTLET   : ${lastOrder.outlet}`,
+        `ITEMS    : ${lastOrder.items}`,
+        `TOTAL    : ₹${lastOrder.total}`,
+        `DATE     : ${lastOrder.date}`,
+        `STATUS   : ${lastOrder.status}`,
+        '----------------------',
+        'TRACKING LINK (SWIGGY API):',
+        lastOrder.trackingUrl,
+        '----------------------',
+        'STATUS   : REJECTED & NOT SAVED',
+        'FILE     : PRESERVED (NOT DELETED)'
+      );
+
+      replyMarkup = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '🚀 VIEW LAST ORDER TRACKING', url: lastOrder.trackingUrl }
+            ],
+            [
+              { text: '🛒 ADD ITEM', callback_data: 'tb_cart_prompt' },
+              { text: '🔑 LOGIN ANOTHER', callback_data: 'tb_login_prompt' }
+            ]
+          ]
+        }
+      };
+    } else {
+      rejectLines.push(
+        'ORDERS   : NO PAST ORDERS FOUND',
+        '----------------------',
+        'STATUS   : REJECTED & NOT SAVED',
+        'FILE     : PRESERVED (NOT DELETED)',
+        '----------------------',
+        'SEND AN ACCOUNT WITH FREE CASH!'
+      );
+    }
+
     await ctx.reply(mono(rejectLines.join('\n')), {
       parse_mode: 'HTML',
-      ...getMainMenuKeyboard(s)
+      ...replyMarkup
     });
     return;
   }
