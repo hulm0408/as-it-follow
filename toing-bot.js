@@ -704,7 +704,7 @@ export function setupToingBot(bot) {
             inline_keyboard: [
               [
                 { text: '❌ CANCEL', callback_data: 'tb_cancel_order' },
-                { text: '✅ I HAVE PAID', callback_data: `tb_paid_${realQr.swiggyOrderId}` }
+                { text: '✅ I HAVE PAID', callback_data: `tb_paid_${activeOrderId}` }
               ]
             ]
           }
@@ -730,7 +730,7 @@ export function setupToingBot(bot) {
   });
 
   // 9. Paid Confirmation
-  bot.action(/^tb_paid_(\d+)$/, async (ctx) => {
+  bot.action(/^tb_paid_(.+)$/, async (ctx) => {
     const orderId = ctx.match[1];
     await ctx.answerCbQuery('Payment verified!').catch(() => {});
     const s = getState(ctx.from.id);
