@@ -77,4 +77,4 @@ temp-clone/
 test_chat_mockup_flow.mjs
 test_json_analyzer.mjs
 test_local_storage_manager.mjs
-test_toing_bot.mjs
+!test_toing_bot.mjs
