@@ -963,6 +963,86 @@ export async function cancelOrder(account, orderId, reason = 'User requested can
   }
 }
 
+export function getAllowedUserIds() {
+  const allowed = new Set();
+  const rawList = process.env.ALLOWED_USER_IDS || '';
+  if (rawList.trim()) {
+    rawList.split(',').map(s => s.trim()).filter(Boolean).forEach(id => allowed.add(id));
+  } else if (process.env.BOSS_ID && process.env.BOSS_ID.trim()) {
+    allowed.add(process.env.BOSS_ID.trim());
+  }
+  return allowed;
+}
+
+export function checkUserWhitelist(userId, commandName = null) {
+  const allowed = getAllowedUserIds();
+  if (allowed.size === 0) return { allowed: true };
+  const uIdStr = String(userId || '');
+  if (commandName === 'start' || commandName === 'help') {
+    return { allowed: true, isBypass: true };
+  }
+  if (allowed.has(uIdStr)) {
+    return { allowed: true };
+  }
+  return {
+    allowed: false,
+    message: `ACCESS DENIED. YOUR TELEGRAM ID IS: ${uIdStr}`
+  };
+}
+
+export const userRateLimits = new Map();
+
+export function checkRateLimit(userId, now = Date.now(), windowMs = 60000, maxLimit = 20) {
+  const key = String(userId || '');
+  if (!userRateLimits.has(key)) {
+    userRateLimits.set(key, []);
+  }
+  const timestamps = userRateLimits.get(key).filter(ts => now - ts < windowMs);
+  if (timestamps.length >= maxLimit) {
+    userRateLimits.set(key, timestamps);
+    return { allowed: false, count: timestamps.length };
+  }
+  timestamps.push(now);
+  userRateLimits.set(key, timestamps);
+  return { allowed: true, count: timestamps.length };
+}
+
+export const MAX_DOCUMENT_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
+
+export function checkDocumentFileSize(fileSize) {
+  const size = Number(fileSize || 0);
+  if (size > MAX_DOCUMENT_FILE_SIZE) {
+    return {
+      allowed: false,
+      size,
+      maxAllowed: MAX_DOCUMENT_FILE_SIZE,
+      message: `FILE TOO LARGE\n----------------------\nUploaded file exceeds 5 MB limit (${(size / (1024 * 1024)).toFixed(1)} MB).\nPlease upload accounts file under 5 MB.`
+    };
+  }
+  return { allowed: true, size };
+}
+
+export function formatHelpGuide(userId = 'UNKNOWN') {
+  return [
+    'TOING BOT USAGE GUIDE',
+    '----------------------',
+    `YOUR TELEGRAM ID : ${userId}`,
+    '----------------------',
+    'COMMANDS:',
+    '/start  - Open main dashboard & orders',
+    '/help   - Show this help guide & your ID',
+    '/cancel - Reset active step & order flow',
+    '----------------------',
+    'HOW TO ORDER:',
+    '1. Click ⚡ FORCE LOGIN (+₹50) or send Swiggy session JSON file / token.',
+    '2. Send a Swiggy delivery address link or text address.',
+    '3. Send restaurant name (e.g. Patanwala, KFC) to search open outlets.',
+    '4. Select your outlet and add dishes to cart.',
+    '5. Tap 💳 CHECKOUT to generate the live Swiggy UPI payment QR.',
+    '6. Pay using your UPI app (GPay/PhonePe/Paytm/BHIM).',
+    '7. Tap ✅ I HAVE PAID to confirm and get real-time Swiggy tracking.'
+  ].join('\n');
+}
 
 export function setupToingBot(bot) {
   // Hydrate persistence on boot
@@ -976,6 +1056,50 @@ export function setupToingBot(bot) {
 
   process.once('SIGINT', () => { try { saveStateToDisk(); } catch (_) {} });
   process.once('SIGTERM', () => { try { saveStateToDisk(); } catch (_) {} });
+
+  // Whitelist, Rate Limiting & File Size Middleware
+  bot.use(async (ctx, next) => {
+    const userId = ctx.from?.id;
+    if (!userId) return next();
+
+    // Check command name if text message
+    let commandName = null;
+    const text = ctx.message?.text || '';
+    if (text.startsWith('/')) {
+      commandName = text.slice(1).split(/[\s@]/)[0].toLowerCase();
+    }
+
+    const check = checkUserWhitelist(userId, commandName);
+    if (!check.allowed) {
+      if (ctx.callbackQuery) {
+        await ctx.answerCbQuery(check.message, { show_alert: true }).catch(() => {});
+      } else {
+        await ctx.reply(mono(check.message), { parse_mode: 'HTML' });
+      }
+      return;
+    }
+
+    const rateCheck = checkRateLimit(userId);
+    if (!rateCheck.allowed) {
+      if (ctx.callbackQuery) {
+        await ctx.answerCbQuery('Rate limit exceeded (max 20 msg/min).', { show_alert: true }).catch(() => {});
+      } else {
+        await ctx.reply(mono('RATE LIMIT EXCEEDED\n----------------------\nMaximum 20 messages per minute.\nPlease wait before trying again.'), { parse_mode: 'HTML' });
+      }
+      return;
+    }
+
+    const docSize = ctx.message?.document?.file_size;
+    if (docSize) {
+      const docCheck = checkDocumentFileSize(docSize);
+      if (!docCheck.allowed) {
+        await ctx.reply(mono(docCheck.message), { parse_mode: 'HTML' });
+        return;
+      }
+    }
+
+    return next();
+  });
 
   // 1. /start
   bot.command('start', async (ctx) => {
@@ -1012,6 +1136,49 @@ export function setupToingBot(bot) {
     const s = getState(ctx.from.id);
     s.step = 'IDLE';
     await ctx.reply(formatDashboard(s), {
+      parse_mode: 'HTML',
+      ...getMainMenuKeyboard(s)
+    });
+  });
+
+  // /help command
+  bot.command('help', async (ctx) => {
+    const userId = ctx.from?.id || 'UNKNOWN';
+    await ctx.reply(mono(formatHelpGuide(userId)), { parse_mode: 'HTML' });
+  });
+
+  // /cancel command
+  bot.command('cancel', async (ctx) => {
+    const s = getState(ctx.from.id);
+    const orderId = s.currentOrderId;
+
+    if (orderId && !s.paymentVerified) {
+      await ctx.reply(mono(`ACTIVE UNPAID ORDER IN PROGRESS\n----------------------\nORDER ID : #${orderId}\nAMOUNT   : ₹${s.currentToPay || s.expectedPayable || 0}\n\nDo you want to cancel this order on Swiggy or reset input only?`), {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '⚠️ CANCEL ON SWIGGY', callback_data: `tb_cancel_confirm_${orderId}` },
+              { text: '↩️ RESET INPUT ONLY', callback_data: 'tb_reset_input' }
+            ]
+          ]
+        }
+      });
+      return;
+    }
+
+    s.step = 'IDLE';
+    await ctx.reply(mono('FLOW CANCELLED\n----------------------\nState reset to idle.'), {
+      parse_mode: 'HTML',
+      ...getMainMenuKeyboard(s)
+    });
+  });
+
+  bot.action('tb_reset_input', async (ctx) => {
+    await ctx.answerCbQuery('Input reset').catch(() => {});
+    const s = getState(ctx.from.id);
+    s.step = 'IDLE';
+    await ctx.reply(mono('INPUT RESET\n----------------------\nState reset to idle. Active order preserved.'), {
       parse_mode: 'HTML',
       ...getMainMenuKeyboard(s)
     });

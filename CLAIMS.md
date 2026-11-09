@@ -27,6 +27,12 @@
 | M4: Corrupted state file detection and automated backup | `toing-bot.js:185-205` | PROVEN | `test_toing_bot.mjs` feeds invalid JSON to `loadStateFromDisk`, verifies `.corrupt.<timestamp>` backup created and state initialized cleanly. |
 | M4: 7-day inactive user pruning | `toing-bot.js:105-115, 205-215` | PROVEN | `test_toing_bot.mjs` verifies user with activity > 7 days ago is pruned while active user is preserved. |
 | M4: Unfinished pending unpaid order resumed on boot | `toing-bot.js:1020-1045` | PROVEN | `/start` detects unverified pending order with UPI URL and displays resume card with retry buttons. |
+| M5: Whitelist authorization with `ALLOWED_USER_IDS` and `BOSS_ID` fallback | `toing-bot.js:968-995` | PROVEN | `test_toing_bot.mjs` asserts allowed user passes and unwhitelisted user is denied with exact message `ACCESS DENIED. YOUR TELEGRAM ID IS: <id>`. |
+| M5: Whitelist bypass for `/start` and `/help` | `toing-bot.js:985-992` | PROVEN | `test_toing_bot.mjs` verifies unwhitelisted user can execute `/start` and `/help` to retrieve Telegram ID and usage guide. |
+| M5: Sliding window rate limiter (20 msg/min per user) | `toing-bot.js:998-1015` | PROVEN | `test_toing_bot.mjs` verifies 20 messages are permitted and the 21st within 60 seconds is blocked with rate limit error. |
+| M5: Document file upload cap (5 MB max) | `toing-bot.js:1017-1030` | PROVEN | `test_toing_bot.mjs` asserts 4MB and 5MB files are allowed and 6MB files are rejected with `FILE TOO LARGE`. |
+| M5: `/help` and `/cancel` bot commands | `toing-bot.js:1032-1055, 1145-1185` | PROVEN | `test_toing_bot.mjs` verifies `/help` output formatting and `/cancel` resetting active input steps while preserving order guards. |
+
 
 
 

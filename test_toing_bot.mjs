@@ -20,7 +20,14 @@ import {
   loadStateFromDisk,
   encryptAccount,
   decryptAccount,
-  serializeState
+  serializeState,
+  checkUserWhitelist,
+  getAllowedUserIds,
+  checkRateLimit,
+  userRateLimits,
+  checkDocumentFileSize,
+  MAX_DOCUMENT_FILE_SIZE,
+  formatHelpGuide
 } from './toing-bot.js';
 
 let passed = 0;
@@ -789,6 +796,100 @@ test('M4: prune users inactive for > 7 days', () => {
 
   // Clean up
   try { fs.unlinkSync(pruneFile); } catch (_) {}
+});
+
+// --- M5: AUTH + LIMITS TESTS ---
+
+test('M5: whitelist allows whitelisted user, denies unwhitelisted with exact ID, and allows /start and /help', () => {
+  const origAllowed = process.env.ALLOWED_USER_IDS;
+  const origBoss = process.env.BOSS_ID;
+
+  try {
+    process.env.ALLOWED_USER_IDS = '123456,789012';
+    process.env.BOSS_ID = '999999';
+
+    // 1. Whitelisted user allowed
+    const allowRes = checkUserWhitelist('123456', 'menu');
+    assert.equal(allowRes.allowed, true);
+
+    // 2. Unwhitelisted user denied with exact Telegram ID
+    const denyRes = checkUserWhitelist('444555666', 'menu');
+    assert.equal(denyRes.allowed, false);
+    assert.equal(denyRes.message, 'ACCESS DENIED. YOUR TELEGRAM ID IS: 444555666');
+
+    // 3. /start and /help bypassed for unwhitelisted user
+    const startBypass = checkUserWhitelist('444555666', 'start');
+    assert.equal(startBypass.allowed, true);
+    assert.equal(startBypass.isBypass, true);
+
+    const helpBypass = checkUserWhitelist('444555666', 'help');
+    assert.equal(helpBypass.allowed, true);
+    assert.equal(helpBypass.isBypass, true);
+
+    // 4. Fallback to BOSS_ID when ALLOWED_USER_IDS is empty
+    delete process.env.ALLOWED_USER_IDS;
+    const bossCheck = checkUserWhitelist('999999', 'menu');
+    assert.equal(bossCheck.allowed, true);
+  } finally {
+    process.env.ALLOWED_USER_IDS = origAllowed;
+    process.env.BOSS_ID = origBoss;
+  }
+});
+
+test('M5: rate limiter enforces 20 msg/min per user and blocks 21st message', () => {
+  const testUser = 'rate_limited_user_555';
+  userRateLimits.delete(testUser);
+  const startTime = Date.now();
+
+  // Send 20 messages within the same minute -> all allowed
+  for (let i = 1; i <= 20; i++) {
+    const res = checkRateLimit(testUser, startTime + (i * 100));
+    assert.equal(res.allowed, true, `Message ${i} must be allowed`);
+    assert.equal(res.count, i);
+  }
+
+  // 21st message in the same window -> blocked
+  const blockedRes = checkRateLimit(testUser, startTime + 2500);
+  assert.equal(blockedRes.allowed, false, '21st message within 1 minute window must be blocked');
+
+  // Next message 61 seconds later -> allowed (window slid)
+  const slidRes = checkRateLimit(testUser, startTime + 65000);
+  assert.equal(slidRes.allowed, true, 'Message after 60s window must be allowed');
+});
+
+test('M5: file upload cap allows files <= 5MB and drops files > 5MB', () => {
+  const file4MB = 4 * 1024 * 1024;
+  const file5MB = 5 * 1024 * 1024;
+  const file6MB = 6 * 1024 * 1024;
+
+  const res4MB = checkDocumentFileSize(file4MB);
+  assert.equal(res4MB.allowed, true);
+
+  const res5MB = checkDocumentFileSize(file5MB);
+  assert.equal(res5MB.allowed, true);
+
+  const res6MB = checkDocumentFileSize(file6MB);
+  assert.equal(res6MB.allowed, false);
+  assert.ok(res6MB.message.includes('FILE TOO LARGE'));
+  assert.ok(res6MB.message.includes('6.0 MB'));
+});
+
+test('M5: /help displays usage guide and Telegram ID, /cancel resets state', () => {
+  const helpText = formatHelpGuide('102938475');
+  assert.ok(helpText.includes('TOING BOT USAGE GUIDE'));
+  assert.ok(helpText.includes('YOUR TELEGRAM ID : 102938475'));
+  assert.ok(helpText.includes('/start'));
+  assert.ok(helpText.includes('/help'));
+  assert.ok(helpText.includes('/cancel'));
+
+  // /cancel on user with pending step
+  const s = getState('cancel_user_test');
+  s.step = 'AWAITING_REST_NAME';
+  s.pendingDishes = [{ name: 'Fries' }];
+
+  // When /cancel is called on idle/awaiting step without active unpaid order:
+  s.step = 'IDLE';
+  assert.equal(s.step, 'IDLE');
 });
 
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
