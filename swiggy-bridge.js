@@ -1292,7 +1292,7 @@ export async function getLiveSwiggyWafToken(forceRefresh = false) {
   // If local Chromium is not available (e.g. Render node environment), pull latest live WAF token from Cloud Vault!
   if (!canUseStealthBrowser()) {
     try {
-      const { pullAccountsFromCloudVault } = await import('./vault-sync.js');
+      const { pullAccountsFromCloudVault } = await import('./legacy/vault-sync.js');
       const remote = await pullAccountsFromCloudVault();
       if (remote?.waf?.token && (Date.now() - (remote.waf.acquiredAt || 0) < WAF_CACHE_TTL_MS)) {
         latestSharedWafToken = remote.waf.token;

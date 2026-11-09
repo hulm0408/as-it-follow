@@ -32,6 +32,10 @@
 | M5: Sliding window rate limiter (20 msg/min per user) | `toing-bot.js:998-1015` | PROVEN | `test_toing_bot.mjs` verifies 20 messages are permitted and the 21st within 60 seconds is blocked with rate limit error. |
 | M5: Document file upload cap (5 MB max) | `toing-bot.js:1017-1030` | PROVEN | `test_toing_bot.mjs` asserts 4MB and 5MB files are allowed and 6MB files are rejected with `FILE TOO LARGE`. |
 | M5: `/help` and `/cancel` bot commands | `toing-bot.js:1032-1055, 1145-1185` | PROVEN | `test_toing_bot.mjs` verifies `/help` output formatting and `/cancel` resetting active input steps while preserving order guards. |
+| M6: Move unreachable legacy modules to `legacy/` | `legacy/` | PROVEN | Moved 15 dead files (`boss-panel.js`, `simple-chat.js`, `forwarded-order-flow.js`, etc.) into `legacy/`; `node --check index.js` and `node test_toing_bot.mjs` pass cleanly. |
+| M6: Prefix obsolete test files with `legacy_` | `legacy_test_*.mjs` | PROVEN | All old tests prefixed with `legacy_`; `test_toing_bot.mjs` is the sole active test suite mapped to `npm test`. |
+| M6: Rewrite `README.md` focusing strictly on active Toing architecture | `README.md:1-55` | PROVEN | README describes only `toing-bot.js` + `swiggy-cart.js` engine and lists one line per legacy module explaining why it was moved. |
+
 
 
 
