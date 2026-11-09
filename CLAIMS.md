@@ -9,5 +9,8 @@
 | `toing-bot.js` state is in-memory `Map` (no persistence across restarts) | `toing-bot.js:39-69` | PROVEN | Line 39 declares `const userState = new Map();`. No database or filesystem serialization exists in `toing-bot.js`. |
 | Offline execution protocol enforced (no live Telegram/Swiggy execution claimed) | `test_toing_bot.mjs:1-125` | PROVEN | Unit test runs in hermetic offline environment with assert checks and zero live network sockets. |
 | `npm run test:guards` filename fix for v20 | `package.json:11` | PROVEN | Replaced non-existent `test_v20_single_chat_consent_tracking_e2e.mjs` with `test_v20_single_card_chat_e2e.mjs` (exists on disk). |
-| `test_toing_bot.mjs` un-ignored and passing | `.gitignore:80`, `test_toing_bot.mjs:1-125` | PROVEN | `git status` shows `test_toing_bot.mjs` untracked. Ran `node test_toing_bot.mjs` with output `7 passed, 0 failed.` (exit code 0). |
+| `test_toing_bot.mjs` un-ignored and passing | `.gitignore:80`, `test_toing_bot.mjs:1-125` | PROVEN | `git status` shows `test_toing_bot.mjs` tracked. Ran `node test_toing_bot.mjs` with output `7 passed, 0 failed.` (exit code 0). |
+| M1: Payment truth verification with single-flight check | `toing-bot.js:44, 325-440` | PROVEN | `node test_toing_bot.mjs` tests CONFIRMED, PENDING, FAILED, and double-tap concurrency. Output: `11 passed, 0 failed.` (exit code 0). |
+| M1: `order/confirm` fires only on confirmed gateway transaction | `toing-bot.js:355-385`, `swiggy-cart.js:8505-8515` | PROVEN | Stubbed fetch test verifies `order/confirm` fires exactly once when gateway status is success, and 0 times when pending/failed. |
+| M1: Single-flight concurrency guard and double-tap idempotency | `toing-bot.js:44, 330-350` | PROVEN | Concurrent double-tap in `test_toing_bot.mjs` returns `status: 'IN_FLIGHT'` with message `check chal raha hai` and exactly 1 confirm call. |
 

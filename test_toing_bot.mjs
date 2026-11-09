@@ -1,6 +1,6 @@
 // ============================================================================
 // REAL TEST SUITE FOR TOING BOT ENGINE
-// Verifies: State isolation, Dashboard rendering, Keyboards, Tracking API, QR Buffer
+// Verifies: State isolation, Dashboard rendering, Keyboards, Tracking API, QR Buffer, M1 Payment Truth
 // ============================================================================
 
 import assert from 'node:assert/strict';
@@ -9,7 +9,9 @@ import {
   getState,
   formatDashboard,
   getMainMenuKeyboard,
-  fetchLiveOrderTrackingApi
+  fetchLiveOrderTrackingApi,
+  verifyOrderPayment,
+  paymentInFlight
 } from './toing-bot.js';
 
 let passed = 0;
@@ -53,6 +55,7 @@ test('getState returns isolated state per user and initializes defaults', () => 
   assert.deepEqual(s1.cart, []);
   assert.deepEqual(s1.savedCart, []);
   assert.equal(s1.account, null);
+  assert.equal(s1.paymentVerified, false);
 
   s1.step = 'AWAITING_INPUT';
   assert.equal(getState(uid1).step, 'AWAITING_INPUT');
@@ -150,6 +153,235 @@ await asyncTest('QRCode.toBuffer produces a valid PNG buffer', async () => {
   assert.equal(buffer[1], 0x50);
   assert.equal(buffer[2], 0x4E);
   assert.equal(buffer[3], 0x47);
+});
+
+// Helper for stubbed fetch response
+function makeMockResponse(data, status = 200) {
+  const text = typeof data === 'string' ? data : JSON.stringify(data);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get: (h) => (h && h.toLowerCase() === 'content-type' ? 'application/json' : ''),
+      forEach: () => {}
+    },
+    text: async () => text,
+    json: async () => (typeof data === 'string' ? JSON.parse(data) : data)
+  };
+}
+
+// 6. M1 Payment Truth: verifyOrderPayment with stubbed fetch
+await asyncTest('verifyOrderPayment: CONFIRMED outcome reaches order/confirm once and extracts tracking', async () => {
+  const originalFetch = globalThis.fetch;
+  let confirmCalls = 0;
+  const mockJwt = 'mock.eyJ1c2VyX2lkIjoiOTk5OTkiLCJleHAiOjE5OTk5OTk5OTl9.sig';
+  const mockAcc = {
+    phone: '9888877777',
+    customerId: '99999',
+    tid: mockJwt,
+    jwtTid: mockJwt,
+    token: mockJwt,
+    cookies: `tid=${mockJwt}; _session_tid=deadbeef1234`
+  };
+  const testOrderId = '198273645012';
+
+  globalThis.fetch = async (url) => {
+    const urlStr = String(url);
+    if (urlStr.includes('vpa-txn-status')) {
+      return makeMockResponse({ statusCode: 0, data: 'success' });
+    }
+    if (urlStr.includes('order/confirm')) {
+      confirmCalls++;
+      return makeMockResponse({
+        statusCode: 0,
+        data: { order_id: testOrderId, order_status: 'CONFIRMED' }
+      });
+    }
+    if (urlStr.includes('order/details') || urlStr.includes('order/all')) {
+      return makeMockResponse({
+        statusCode: 0,
+        tid: mockJwt,
+        data: {
+          orders: [{
+            order_id: testOrderId,
+            order_status: 'CONFIRMED',
+            order_items: [{ name: 'Biryani', quantity: 1 }]
+          }]
+        }
+      });
+    }
+    return makeMockResponse({ statusCode: 0, data: {} });
+  };
+
+  try {
+    const state = {
+      paymentVerified: false,
+      currentPaymentTxnId: 'PAAS_TEST_1',
+      currentQrCreatedAt: Date.now() - 5000
+    };
+    const res = await verifyOrderPayment(mockAcc, testOrderId, 'PAAS_TEST_1', state);
+
+    assert.equal(res.status, 'CONFIRMED');
+    assert.equal(res.orderId, testOrderId);
+    assert.equal(confirmCalls, 1, 'order/confirm must be called on confirmed payment');
+    assert.equal(state.paymentVerified, true);
+    assert.ok(state.paidAt);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await asyncTest('verifyOrderPayment: PENDING outcome returns retryable status and does not fire order/confirm', async () => {
+  const originalFetch = globalThis.fetch;
+  let confirmCalls = 0;
+  const mockJwt = 'mock.eyJ1c2VyX2lkIjoiOTk5OTkiLCJleHAiOjE5OTk5OTk5OTl9.sig';
+  const mockAcc = {
+    phone: '9888877777',
+    customerId: '99999',
+    tid: mockJwt,
+    jwtTid: mockJwt,
+    token: mockJwt,
+    cookies: `tid=${mockJwt}; _session_tid=deadbeef1234`
+  };
+  const testOrderId = '198273645013';
+
+  globalThis.fetch = async (url) => {
+    const urlStr = String(url);
+    if (urlStr.includes('vpa-txn-status')) {
+      return makeMockResponse({ statusCode: 0, data: 'pending' });
+    }
+    if (urlStr.includes('order/confirm')) {
+      confirmCalls++;
+      return makeMockResponse({ statusCode: 0 });
+    }
+    return makeMockResponse({ statusCode: 0, tid: mockJwt, data: { orders: [] } });
+  };
+
+  try {
+    const state = {
+      paymentVerified: false,
+      currentPaymentTxnId: 'PAAS_TEST_2',
+      currentQrCreatedAt: Date.now() - 10000
+    };
+    const res = await verifyOrderPayment(mockAcc, testOrderId, 'PAAS_TEST_2', state);
+
+    assert.equal(res.status, 'PENDING');
+    assert.equal(confirmCalls, 0, 'order/confirm must NOT fire when payment is pending');
+    assert.equal(res.attempts, 1);
+    assert.equal(state.paymentVerified, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await asyncTest('verifyOrderPayment: FAILED outcome returns real failure reason without confirming order', async () => {
+  const originalFetch = globalThis.fetch;
+  let confirmCalls = 0;
+  const mockJwt = 'mock.eyJ1c2VyX2lkIjoiOTk5OTkiLCJleHAiOjE5OTk5OTk5OTl9.sig';
+  const mockAcc = {
+    phone: '9888877777',
+    customerId: '99999',
+    tid: mockJwt,
+    jwtTid: mockJwt,
+    token: mockJwt,
+    cookies: `tid=${mockJwt}; _session_tid=deadbeef1234`
+  };
+  const testOrderId = '198273645014';
+
+  globalThis.fetch = async (url) => {
+    const urlStr = String(url);
+    if (urlStr.includes('vpa-txn-status')) {
+      return makeMockResponse({
+        statusCode: 0,
+        data: 'failed',
+        failure_reason: 'User cancelled UPI pin prompt'
+      });
+    }
+    if (urlStr.includes('order/confirm')) {
+      confirmCalls++;
+      return makeMockResponse({ statusCode: 0 });
+    }
+    return makeMockResponse({ statusCode: 0, tid: mockJwt, data: { orders: [] } });
+  };
+
+  try {
+    const state = {
+      paymentVerified: false,
+      currentPaymentTxnId: 'PAAS_TEST_3',
+      currentQrCreatedAt: Date.now() - 8000
+    };
+    const res = await verifyOrderPayment(mockAcc, testOrderId, 'PAAS_TEST_3', state);
+
+    assert.equal(res.status, 'FAILED');
+    assert.equal(confirmCalls, 0, 'order/confirm must NOT fire when payment failed');
+    assert.ok(res.reason, 'Must present real failure reason');
+    assert.equal(state.paymentVerified, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await asyncTest('verifyOrderPayment: double tap triggers single-flight and order/confirm fires exactly once', async () => {
+  const originalFetch = globalThis.fetch;
+  let confirmCalls = 0;
+  const mockJwt = 'mock.eyJ1c2VyX2lkIjoiOTk5OTkiLCJleHAiOjE5OTk5OTk5OTl9.sig';
+  const mockAcc = {
+    phone: '9888877777',
+    customerId: '99999',
+    tid: mockJwt,
+    jwtTid: mockJwt,
+    token: mockJwt,
+    cookies: `tid=${mockJwt}; _session_tid=deadbeef1234`
+  };
+  const testOrderId = '198273645015';
+
+  globalThis.fetch = async (url) => {
+    const urlStr = String(url);
+    if (urlStr.includes('vpa-txn-status')) {
+      // Artificial delay so second concurrent call overlaps in-flight
+      await new Promise(r => setTimeout(r, 60));
+      return makeMockResponse({ statusCode: 0, data: 'success' });
+    }
+    if (urlStr.includes('order/confirm')) {
+      confirmCalls++;
+      return makeMockResponse({ statusCode: 0, data: { order_id: testOrderId } });
+    }
+    if (urlStr.includes('order/details') || urlStr.includes('order/all')) {
+      return makeMockResponse({
+        statusCode: 0,
+        tid: mockJwt,
+        data: { orders: [{ order_id: testOrderId, order_status: 'CONFIRMED' }] }
+      });
+    }
+    return makeMockResponse({ statusCode: 0, data: {} });
+  };
+
+  try {
+    const state = {
+      paymentVerified: false,
+      currentPaymentTxnId: 'PAAS_TEST_DOUBLE',
+      currentQrCreatedAt: Date.now()
+    };
+
+    // Fire two calls concurrently
+    const p1 = verifyOrderPayment(mockAcc, testOrderId, 'PAAS_TEST_DOUBLE', state);
+    const p2 = verifyOrderPayment(mockAcc, testOrderId, 'PAAS_TEST_DOUBLE', state);
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    assert.equal(r1.status, 'CONFIRMED', 'First call must succeed and confirm');
+    assert.equal(r2.status, 'IN_FLIGHT', 'Second simultaneous call must be caught as IN_FLIGHT');
+    assert.equal(r2.message, 'check chal raha hai');
+    assert.equal(confirmCalls, 1, 'order/confirm must be called EXACTLY once on double tap');
+
+    // And subsequent tap after confirmation returns idempotent already confirmed
+    const r3 = await verifyOrderPayment(mockAcc, testOrderId, 'PAAS_TEST_DOUBLE', state);
+    assert.equal(r3.status, 'CONFIRMED');
+    assert.equal(r3.alreadyConfirmed, true);
+    assert.equal(confirmCalls, 1, 'order/confirm must NOT fire again after order is confirmed');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);

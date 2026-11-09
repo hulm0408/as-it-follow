@@ -26,7 +26,9 @@ import {
   parseDapiCartPayload,
   buildSwiggyCartItemsPayload,
   dapiFetch,
-  applyLiveCouponToOrder
+  applyLiveCouponToOrder,
+  checkRealSwiggyPaymentAndExtractTracking,
+  extractRealSwiggyTracking
 } from './swiggy-cart.js';
 import { claimSwiggyBreakfastAndLateNightOffers } from './swiggy-bridge.js';
 import {
@@ -37,6 +39,9 @@ import {
 
 // In-memory state tracking per user
 const userState = new Map();
+
+// In-flight payment verification tracker (single-flight per orderId)
+export const paymentInFlight = new Set();
 
 export function getState(userId) {
   const key = String(userId);
@@ -64,6 +69,12 @@ export function getState(userId) {
       pendingOutlets: [],
       pendingDishes: [],
       currentOrderId: null,
+      currentPaymentTxnId: null,
+      currentQrCreatedAt: null,
+      paymentAttempts: 0,
+      paymentVerified: false,
+      paidAt: null,
+      paidOrderId: null,
       currentToPay: 0,
       currentUpiUri: null
     });
@@ -460,6 +471,113 @@ export async function fetchLiveOrderTrackingApi(account, orderId) {
     riderInfo,
     trackingUrl
   };
+}
+
+/**
+ * Verifies order payment on Swiggy gateway via checkRealSwiggyPaymentAndExtractTracking.
+ * Idempotent, single-flight per orderId, handles CONFIRMED, PENDING, FAILED, and UNAVAILABLE.
+ */
+export async function verifyOrderPayment(account, orderId, paymentTxnId, state = {}) {
+  const targetId = String(orderId || '');
+
+  // Idempotency: If already verified, return cached confirmation
+  if (state.paymentVerified && state.paidOrderId === targetId) {
+    return {
+      status: 'CONFIRMED',
+      alreadyConfirmed: true,
+      orderId: targetId,
+      paidAt: state.paidAt,
+      trackingUrl: state.trackingUrl || `https://www.swiggy.com/ofo/track/${targetId}`,
+      orderStatus: state.orderStatus || 'CONFIRMED',
+      message: 'Payment already verified and order confirmed.'
+    };
+  }
+
+  // Single-flight check
+  if (paymentInFlight.has(targetId)) {
+    return {
+      status: 'IN_FLIGHT',
+      orderId: targetId,
+      message: 'check chal raha hai'
+    };
+  }
+
+  paymentInFlight.add(targetId);
+  try {
+    let verif = null;
+    try {
+      verif = await checkRealSwiggyPaymentAndExtractTracking({
+        account,
+        orderId: targetId,
+        paymentTxnId: paymentTxnId || state.currentPaymentTxnId || ''
+      });
+    } catch (err) {
+      console.warn('[FALLBACK] verification unavailable:', err.message);
+      return {
+        status: 'UNAVAILABLE',
+        orderId: targetId,
+        error: err.message,
+        message: `[FALLBACK] verification unavailable: ${err.message}`
+      };
+    }
+
+    if (verif?.paid === true) {
+      let trackingUrl = verif.trackingUrl;
+      if (!trackingUrl && account?.cookies) {
+        const extra = await extractRealSwiggyTracking(account.cookies).catch(() => null);
+        if (extra?.trackingUrl) trackingUrl = extra.trackingUrl;
+      }
+
+      state.paymentVerified = true;
+      state.paidAt = new Date().toISOString();
+      state.paidOrderId = targetId;
+      state.trackingUrl = trackingUrl || `https://www.swiggy.com/ofo/track/${targetId}`;
+      state.orderStatus = verif.orderStatus || 'CONFIRMED';
+      state.deliveryOtp = verif.deliveryOtp || '';
+      state.etaText = verif.etaMinutes ? `${verif.etaMinutes} MINS` : '20-30 MINS';
+
+      return {
+        status: 'CONFIRMED',
+        orderId: targetId,
+        paidAt: state.paidAt,
+        orderStatus: state.orderStatus,
+        etaText: state.etaText,
+        deliveryOtp: state.deliveryOtp,
+        trackingUrl: state.trackingUrl,
+        raw: verif
+      };
+    }
+
+    const failureReason = verif?.gatewayFetchError || verif?.statusStr || '';
+    const isExplicitFail = /fail|cancel|aborted|rejected/i.test(verif?.txnState || failureReason);
+
+    state.paymentAttempts = (state.paymentAttempts || 0) + 1;
+    const elapsedSec = state.currentQrCreatedAt
+      ? Math.max(0, Math.round((Date.now() - Number(state.currentQrCreatedAt)) / 1000))
+      : 0;
+
+    if (isExplicitFail) {
+      return {
+        status: 'FAILED',
+        orderId: targetId,
+        attempts: state.paymentAttempts,
+        elapsedSec,
+        reason: failureReason || verif?.txnState || 'Gateway transaction failed',
+        raw: verif
+      };
+    }
+
+    return {
+      status: 'PENDING',
+      orderId: targetId,
+      attempts: state.paymentAttempts,
+      elapsedSec,
+      txnState: verif?.txnState || 'pending',
+      raw: verif
+    };
+  } finally {
+    paymentInFlight.delete(targetId);
+  }
 }
 
 export function setupToingBot(bot) {
@@ -1176,6 +1294,7 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
         } catch {}
         upiUrl = uStr;
         if (realQr.swiggyOrderId) activeOrderId = realQr.swiggyOrderId;
+        if (realQr.paymentTxnId) s.currentPaymentTxnId = realQr.paymentTxnId;
       }
     } catch (e) {
       console.warn('[Real QR Fallback to Toing UPI Intent]', e.message);
@@ -1184,6 +1303,11 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
     await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
     s.currentOrderId = activeOrderId;
     s.currentUpiUri = upiUrl;
+    s.currentQrCreatedAt = Date.now();
+    s.paymentAttempts = 0;
+    s.paymentVerified = false;
+    s.paidAt = null;
+    s.paidOrderId = null;
 
     try {
       const qrBuffer = await QRCode.toBuffer(upiUrl, {
@@ -1239,38 +1363,155 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
     }
   });
 
-  // 9. Paid Confirmation with API-fetched Live Tracking
+  // 9. Paid Confirmation with Real Gateway Verification (M1 Payment Truth)
   bot.action(/^tb_paid_(.+)$/, async (ctx) => {
     const orderId = ctx.match[1];
-    await ctx.answerCbQuery('Fetching live tracking from Swiggy API...').catch(() => {});
     const s = getState(ctx.from.id);
 
-    try {
-      await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
-    } catch (_) {}
-
-    const waitMsg = await ctx.reply(mono('CONNECTING TO SWIGGY API & FETCHING TRACKING...'), { parse_mode: 'HTML' });
-    const trackInfo = await fetchLiveOrderTrackingApi(s.account, orderId);
-    await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
-
-    // Preserve cart & restaurant in savedCart so user can 1-tap checkout again on next account!
-    if (s.cart?.length) {
-      s.savedCart = [...s.cart];
-      s.savedRestaurant = s.restaurant;
+    // Single-flight check: second tap gets instant warning
+    if (paymentInFlight.has(orderId)) {
+      await ctx.answerCbQuery('check chal raha hai...').catch(() => {});
+      return;
     }
 
+    await ctx.answerCbQuery('Verifying payment on Swiggy gateway...').catch(() => {});
+
+    // Guard: refuse to duplicate if already verified
+    if (s.paymentVerified && s.paidOrderId === orderId) {
+      await ctx.reply(mono([
+        'ORDER ALREADY VERIFIED & PAID',
+        '----------------------',
+        `ORDER ID : #${s.paidOrderId}`,
+        `PAID AT  : ${s.paidAt}`,
+        `STATUS   : ${s.orderStatus || 'CONFIRMED'}`,
+        '----------------------',
+        'TRACKING LINK (SWIGGY API):',
+        s.trackingUrl || `https://www.swiggy.com/ofo/track/${orderId}`
+      ].join('\n')), {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🚀 LIVE TRACKING', url: s.trackingUrl || `https://www.swiggy.com/ofo/track/${orderId}` }]
+          ]
+        }
+      });
+      return;
+    }
+
+    const waitMsg = await ctx.reply(mono('CONNECTING TO GATEWAY & VERIFYING PAYMENT...'), { parse_mode: 'HTML' });
+
+    const result = await verifyOrderPayment(s.account, orderId, s.currentPaymentTxnId, s);
+
+    await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
+
+    if (result.status === 'IN_FLIGHT') {
+      await ctx.reply(mono('check chal raha hai...'), { parse_mode: 'HTML' });
+      return;
+    }
+
+    if (result.status === 'CONFIRMED') {
+      if (s.cart?.length) {
+        s.savedCart = [...s.cart];
+        s.savedRestaurant = s.restaurant;
+      }
+      s.cart = [];
+      s.step = 'IDLE';
+
+      const lines = [
+        'ORDER CONFIRMED & PAID',
+        '----------------------',
+        `ORDER ID : #${result.orderId}`,
+        `STATUS   : ${result.orderStatus || 'CONFIRMED'}`,
+        `ETA      : ${result.etaText || '20-30 MINS'}`,
+        ...(result.deliveryOtp ? [`OTP      : ${result.deliveryOtp}`] : []),
+        '----------------------',
+        'TRACKING LINK (SWIGGY API):',
+        result.trackingUrl,
+        '----------------------',
+        'THANK YOU FOR CHOOSING TOING!'
+      ];
+
+      await ctx.reply(mono(lines.join('\n')), {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '🚀 LIVE TRACKING', url: result.trackingUrl },
+              { text: '🔄 REFRESH STATUS', callback_data: `tb_track_${orderId}` }
+            ],
+            [
+              { text: '⚡ CHECKOUT NEXT ACCOUNT', callback_data: 'tb_checkout' }
+            ]
+          ]
+        }
+      });
+      return;
+    }
+
+    if (result.status === 'FAILED') {
+      const lines = [
+        'PAYMENT VERIFICATION FAILED',
+        '----------------------',
+        `ORDER ID : #${result.orderId}`,
+        `REASON   : ${result.reason}`,
+        `ATTEMPTS : ${result.attempts}`,
+        `ELAPSED  : ${result.elapsedSec}s`,
+        '----------------------',
+        'TRANSACTION WAS NOT COMPLETED.',
+        'YOU MAY RETRY CHECK OR GENERATE NEW QR.'
+      ];
+
+      await ctx.reply(mono(lines.join('\n')), {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '🔄 RE-CHECK PAYMENT', callback_data: `tb_paid_${orderId}` },
+              { text: '💳 NEW QR', callback_data: 'tb_pay_qr' }
+            ]
+          ]
+        }
+      });
+      return;
+    }
+
+    if (result.status === 'UNAVAILABLE') {
+      // Explicit fallback label per rule
+      const lines = [
+        '[FALLBACK] VERIFICATION UNAVAILABLE',
+        '----------------------',
+        `ORDER ID : #${result.orderId}`,
+        `REASON   : ${result.error}`,
+        '----------------------',
+        'COULD NOT REACH PAYMENT GATEWAY.',
+        'ORDER IS NOT CONFIRMED YET.',
+        'PLEASE RETRY IN A FEW MOMENTS.'
+      ];
+
+      await ctx.reply(mono(lines.join('\n')), {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '🔄 RETRY CHECK', callback_data: `tb_paid_${orderId}` }
+            ]
+          ]
+        }
+      });
+      return;
+    }
+
+    // Default: PENDING
     const lines = [
-      'ORDER PLACED & TRACKING LIVE',
+      'PAYMENT STILL PENDING',
       '----------------------',
-      `ORDER ID : #${trackInfo.orderId}`,
-      `STATUS   : ${trackInfo.statusText}`,
-      `ETA      : ${trackInfo.etaText}`,
-      `RIDER    : ${trackInfo.riderInfo}`,
+      `ORDER ID : #${result.orderId}`,
+      'STATUS   : WAITING FOR UPI SETTLEMENT',
+      `ATTEMPTS : ${result.attempts}`,
+      `ELAPSED  : ${result.elapsedSec}s`,
       '----------------------',
-      'TRACKING LINK (SWIGGY API):',
-      trackInfo.trackingUrl,
-      '----------------------',
-      'THANK YOU FOR CHOOSING TOING!'
+      'COMPLETE PAYMENT IN YOUR UPI APP',
+      'THEN CLICK RE-CHECK BELOW:'
     ];
 
     await ctx.reply(mono(lines.join('\n')), {
@@ -1278,17 +1519,12 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
       reply_markup: {
         inline_keyboard: [
           [
-            { text: '🚀 LIVE TRACKING', url: trackInfo.trackingUrl },
-            { text: '🔄 REFRESH STATUS', callback_data: `tb_track_${orderId}` }
-          ],
-          [
-            { text: '⚡ CHECKOUT NEXT ACCOUNT', callback_data: 'tb_checkout' }
+            { text: '🔄 RE-CHECK PAYMENT', callback_data: `tb_paid_${orderId}` },
+            { text: '💳 SHOW QR AGAIN', callback_data: 'tb_pay_qr' }
           ]
         ]
       }
     });
-
-    s.step = 'IDLE';
   });
 
   // Live Tracking Refresh via Swiggy API
