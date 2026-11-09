@@ -1,8 +1,26 @@
+import http from 'node:http';
 import './network-shield.js';
 import { installBulletproofTelegramTransport } from './network-shield.js';
 import 'dotenv/config';
 import { Telegraf } from 'telegraf';
 import { setupToingBot } from './toing-bot.js';
+
+// Mount lightweight HTTP health check server if PORT is provided (Render Web Service compatibility)
+const port = process.env.PORT;
+if (port) {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/health' || req.url === '/') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`[HEALTH SERVER] Listening on port ${port}`);
+  });
+}
 
 const token = process.env.BOT_TOKEN;
 if (!token) {

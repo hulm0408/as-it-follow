@@ -892,6 +892,54 @@ test('M5: /help displays usage guide and Telegram ID, /cancel resets state', () 
   assert.equal(s.step, 'IDLE');
 });
 
+// --- M7: DEPLOY HYGIENE TESTS ---
+
+test('M7: render.yaml contains only active variables and all exist in .env.example', () => {
+  const renderYamlContent = fs.readFileSync(path.join(process.cwd(), 'render.yaml'), 'utf8');
+  const envExampleContent = fs.readFileSync(path.join(process.cwd(), '.env.example'), 'utf8');
+
+  // Verify dead variables are completely removed from render.yaml
+  const deadVars = [
+    'SIMPLE_CHAT_MODE',
+    'GITHUB_VAULT_TOKEN',
+    'VAULT_ENCRYPTION_KEY',
+    'GITHUB_REPO_SLUG',
+    'BOSS_SECRET'
+  ];
+  for (const dv of deadVars) {
+    assert.ok(!renderYamlContent.includes(dv), `render.yaml must not contain dead var: ${dv}`);
+  }
+
+  // Extract envVar keys from render.yaml
+  const yamlKeyMatches = [...renderYamlContent.matchAll(/key:\s*([A-Z0-9_]+)/g)].map(m => m[1]);
+  assert.ok(yamlKeyMatches.length > 0, 'render.yaml must contain envVars');
+
+  // Core configuration variables that MUST be documented in .env.example
+  const requiredEnvVars = [
+    'BOT_TOKEN',
+    'ALLOWED_USER_IDS',
+    'BOSS_ID',
+    'DATA_DIR',
+    'PERSISTENCE_SECRET'
+  ];
+
+  for (const reqVar of requiredEnvVars) {
+    assert.ok(
+      envExampleContent.includes(`${reqVar}=`),
+      `.env.example must define ${reqVar}`
+    );
+  }
+
+  // Verify every active var in render.yaml (except runtime constants like NODE_ENV) exists in .env.example
+  for (const k of yamlKeyMatches) {
+    if (k === 'NODE_ENV') continue;
+    assert.ok(
+      envExampleContent.includes(k),
+      `render.yaml variable ${k} must be documented in .env.example`
+    );
+  }
+});
+
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);

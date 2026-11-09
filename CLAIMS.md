@@ -35,6 +35,11 @@
 | M6: Move unreachable legacy modules to `legacy/` | `legacy/` | PROVEN | Moved 15 dead files (`boss-panel.js`, `simple-chat.js`, `forwarded-order-flow.js`, etc.) into `legacy/`; `node --check index.js` and `node test_toing_bot.mjs` pass cleanly. |
 | M6: Prefix obsolete test files with `legacy_` | `legacy_test_*.mjs` | PROVEN | All old tests prefixed with `legacy_`; `test_toing_bot.mjs` is the sole active test suite mapped to `npm test`. |
 | M6: Rewrite `README.md` focusing strictly on active Toing architecture | `README.md:1-55` | PROVEN | README describes only `toing-bot.js` + `swiggy-cart.js` engine and lists one line per legacy module explaining why it was moved. |
+| M7: Clean `render.yaml` with active worker configuration and persistent disk | `render.yaml:1-29` | PROVEN | Removed dead variables (`SIMPLE_CHAT_MODE`, `GITHUB_VAULT_TOKEN`, etc.); configured worker service mounting 1GB `/app/data` disk. |
+| M7: Comprehensive `.env.example` template | `.env.example:1-30` | PROVEN | Created `.env.example` covering all active configuration variables (`BOT_TOKEN`, `ALLOWED_USER_IDS`, `BOSS_ID`, `DATA_DIR`, `PERSISTENCE_SECRET`). |
+| M7: `render.yaml` environment variables cross-validated against `.env.example` | `test_toing_bot.mjs` | PROVEN | Unit test asserts every variable defined in `render.yaml` exists in `.env.example`. |
+| M7: Optional lightweight HTTP `/health` server for web service compatibility | `index.js:8-23` | PROVEN | Mounts HTTP server responding on `GET /health` with `{ status: 'ok', uptime }` only when `PORT` is defined, preserving polling. |
+
 
 
 

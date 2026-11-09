@@ -1,6 +1,6 @@
 services:
   - type: worker
-    name: ammi-abbu-ka-sacha-beta
+    name: toing-swiggy-bot
     runtime: docker
     plan: starter
     region: singapore
@@ -14,17 +14,13 @@ services:
         value: production
       - key: BOT_TOKEN
         sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
       - key: BOSS_ID
-        value: "6484999726"
-      - key: BOSS_SECRET
         sync: false
-      - key: SIMPLE_CHAT_MODE
-        value: "1"
-      - key: GITHUB_REPO_SLUG
-        value: "hulm0408/ammi-abbu-ka-sacha-beta"
-      - key: GITHUB_VAULT_TOKEN
-        sync: false
-      - key: VAULT_ENCRYPTION_KEY
+      - key: DATA_DIR
+        value: /app/data
+      - key: PERSISTENCE_SECRET
         sync: false
       - key: HEADLESS
         value: "true"
