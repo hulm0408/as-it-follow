@@ -20,6 +20,7 @@ import {
   fetchFastRestaurantInfo,
   claimInstamartFreeCash,
   generateRealSwiggyMerchantUpiQr,
+  generatePersonalizedQrCard,
   saveAddressToAccount,
   swiggyCartFlush,
   swiggyCartUpdate,
@@ -477,6 +478,93 @@ export async function fetchLiveOrderTrackingApi(account, orderId) {
  * Verifies order payment on Swiggy gateway via checkRealSwiggyPaymentAndExtractTracking.
  * Idempotent, single-flight per orderId, handles CONFIRMED, PENDING, FAILED, and UNAVAILABLE.
  */
+/**
+ * Renders Swiggy Official Live Bill from cart payload.
+ * Only falls back to local arithmetic when payload has no payable, explicitly marked with [FALLBACK] ESTIMATE.
+ * Removes hardcoded FREE packing/delivery unless payload confirms 0.
+ */
+export function renderToingBill(s, liveCart = null) {
+  const isEstimate = !liveCart || liveCart.finalPayable === undefined;
+
+  if (!isEstimate) {
+    const itemTotal = Number(liveCart.itemTotal ?? liveCart.subtotal ?? 0);
+    const packing = Number(liveCart.packingCharges ?? 0);
+    const delivery = Number(liveCart.deliveryFee ?? 0);
+    const taxes = Number(liveCart.taxesAndCharges ?? 0);
+    const couponDiscount = Number(liveCart.discountAmount ?? 0);
+    const tradeDiscount = Number(liveCart.tradeDiscountTotal ?? 0);
+    const freeCash = Number(liveCart.freeCashApplied ?? liveCart.walletSplitPayAmount ?? 0);
+    const finalPayable = Number(liveCart.finalPayable);
+
+    s.currentToPay = finalPayable;
+    s.expectedPayable = finalPayable;
+
+    const lines = [
+      'SWIGGY OFFICIAL LIVE BILL',
+      '----------------------',
+      `RESTAURANT : ${s.restaurant?.name || 'Selected Outlet'}`,
+      '----------------------'
+    ];
+
+    const displayItems = Array.isArray(liveCart.items) && liveCart.items.length > 0 ? liveCart.items : s.cart;
+    for (const it of displayItems) {
+      const qty = Number(it.qty || it.quantity || 1);
+      const price = Number(it.price || (it.lineTotal ? Math.round(it.lineTotal / qty) : 0));
+      lines.push(`${it.name}`);
+      lines.push(`₹${price} × ${qty} = ₹${price * qty}`);
+    }
+
+    lines.push('----------------------');
+    lines.push(`ITEM TOTAL : ₹${itemTotal}`);
+    lines.push(`PACKING    : ${packing === 0 ? 'FREE' : `₹${packing}`}`);
+    lines.push(`DELIVERY   : ${delivery === 0 ? 'FREE' : `₹${delivery}`}`);
+    if (taxes > 0) lines.push(`TAXES/FEES : ₹${taxes}`);
+    if (couponDiscount > 0) lines.push(`COUPON OFF : -₹${couponDiscount} (${liveCart.couponCode || 'APPLIED'})`);
+    if (tradeDiscount > 0) lines.push(`DISCOUNT   : -₹${tradeDiscount}`);
+    if (freeCash > 0) lines.push(`FREE CASH  : -₹${freeCash}`);
+    lines.push('----------------------');
+    lines.push(`FINAL PAY  : ₹${finalPayable}`);
+
+    return { isEstimate: false, text: lines.join('\n'), finalPayable };
+  }
+
+  // [FALLBACK] ESTIMATE when live cart payload has no payable
+  console.warn('[FALLBACK] Cart payload missing payable, using local estimate');
+  const itemTotal = s.cart.reduce((sum, it) => sum + (it.price * (it.qty || 1)), 0);
+  const estGst = Math.round(itemTotal * 0.05 * 100) / 100;
+  const estBhim = s.bhimOffer ? Math.min(50, itemTotal) : 0;
+  const estRefer = s.referClaimed || s.freeCashAmount > 0 ? Math.min(50, Math.max(0, itemTotal - estBhim)) : 0;
+  const estPayable = Math.max(1, Math.round(itemTotal + estGst - estBhim - estRefer));
+
+  s.currentToPay = estPayable;
+  s.expectedPayable = estPayable;
+
+  const lines = [
+    '[FALLBACK] ESTIMATE BILL',
+    '----------------------',
+    `RESTAURANT : ${s.restaurant?.name || 'Selected Outlet'}`,
+    '----------------------'
+  ];
+
+  for (const it of s.cart) {
+    const qty = it.qty || 1;
+    lines.push(`${it.name}`);
+    lines.push(`₹${it.price} × ${qty} = ₹${it.price * qty}`);
+  }
+
+  lines.push('----------------------');
+  lines.push(`ITEM TOTAL : ₹${itemTotal}`);
+  lines.push('PACKING    : [FALLBACK] ESTIMATE');
+  lines.push('DELIVERY   : [FALLBACK] ESTIMATE');
+  if (estGst > 0) lines.push(`TAXES/GST  : ₹${estGst} [FALLBACK]`);
+  if (estBhim > 0) lines.push(`BHIM OFF   : -₹${estBhim} [FALLBACK]`);
+  if (estRefer > 0) lines.push(`REFER CASH : -₹${estRefer} [FALLBACK]`);
+  lines.push('----------------------');
+  lines.push(`FINAL PAY  : ₹${estPayable} [FALLBACK] ESTIMATE`);
+
+  return { isEstimate: true, text: lines.join('\n'), finalPayable: estPayable };
+}
+
 export async function verifyOrderPayment(account, orderId, paymentTxnId, state = {}) {
   const targetId = String(orderId || '');
 
@@ -1099,51 +1187,9 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
         if (liveCart && (liveCart.finalPayable !== undefined || liveCart.orderTotal !== undefined || s.cart.length > 0)) {
           s.liveCart = liveCart;
 
-          // Display items confirmed on Swiggy cart (or s.cart)
-          const displayItems = Array.isArray(liveCart?.items) && liveCart.items.length > 0 ? liveCart.items : s.cart;
-          let calcItemTotal = 0;
-          for (const it of displayItems) {
-            const qty = it.qty || it.quantity || 1;
-            const price = it.price || (it.lineTotal ? Math.round(it.lineTotal / qty) : 0);
-            calcItemTotal += (price * qty);
-          }
-          const itemTotal = calcItemTotal > 0 ? calcItemTotal : s.cart.reduce((sum, it) => sum + (it.price * (it.qty || 1)), 0);
+          const bill = renderToingBill(s, liveCart);
 
-          // In TOING: Zero Packaging Charges & Free Delivery!
-          const gst = Math.round(itemTotal * 0.05 * 100) / 100;
-          const bhimDiscount = Math.min(50, itemTotal);
-          const referDiscount = s.referClaimed || s.freeCashAmount > 0 ? Math.min(50, Math.max(0, itemTotal - bhimDiscount)) : 0;
-          const tradeDiscount = Number(liveCart?.tradeDiscountTotal || 0);
-
-          const toPay = Math.max(1, Math.round(itemTotal + gst - bhimDiscount - referDiscount - tradeDiscount));
-          s.currentToPay = toPay;
-
-          const lines = [
-            'TOING OFFICIAL LIVE BILL',
-            '----------------------',
-            `RESTAURANT : ${s.restaurant.name}`,
-            '----------------------'
-          ];
-
-          for (const it of displayItems) {
-            const qty = it.qty || it.quantity || 1;
-            const price = it.price || (it.lineTotal ? Math.round(it.lineTotal / qty) : 0);
-            lines.push(`${it.name}`);
-            lines.push(`₹${price} × ${qty} = ₹${price * qty}`);
-          }
-
-          lines.push('----------------------');
-          lines.push(`ITEM TOTAL : ₹${itemTotal}`);
-          lines.push('PACKING    : FREE');
-          lines.push('DELIVERY   : FREE');
-          if (gst > 0) lines.push(`TAXES/GST  : ₹${gst}`);
-          if (tradeDiscount > 0) lines.push(`DISCOUNT   : -₹${tradeDiscount}`);
-          lines.push(`BHIM OFF   : -₹${bhimDiscount} (BHIMNEW)`);
-          if (referDiscount > 0) lines.push(`REFER CASH : -₹${referDiscount}`);
-          lines.push('----------------------');
-          lines.push(`FINAL PAY  : ₹${toPay}`);
-
-          await ctx.reply(mono(lines.join('\n')), {
+          await ctx.reply(mono(bill.text), {
             parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [
@@ -1162,39 +1208,10 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
       }
     }
 
-    // Local breakdown if not yet synced with address
-    const itemTotal = s.cart.reduce((sum, it) => sum + (it.price * (it.qty || 1)), 0);
-    s.currentToPay = itemTotal;
+    // Local breakdown fallback if not yet synced with address (explicitly marked ESTIMATE)
+    const fallbackBill = renderToingBill(s, null);
 
-    const gst = Math.round(itemTotal * 0.05 * 100) / 100;
-    const bhimDiscount = Math.min(50, itemTotal);
-    const referDiscount = s.referClaimed || s.freeCashAmount > 0 ? Math.min(50, Math.max(0, itemTotal - bhimDiscount)) : 0;
-    const toPay = Math.max(1, Math.round(itemTotal + gst - bhimDiscount - referDiscount));
-    s.currentToPay = toPay;
-
-    const lines = [
-      'TOING OFFICIAL LIVE BILL',
-      '----------------------',
-      `RESTAURANT : ${s.restaurant?.name || 'Selected Outlet'}`,
-      '----------------------'
-    ];
-
-    for (const it of s.cart) {
-      lines.push(`${it.name}`);
-      lines.push(`₹${it.price} × ${it.qty || 1} = ₹${it.price * (it.qty || 1)}`);
-    }
-
-    lines.push('----------------------');
-    lines.push(`ITEM TOTAL : ₹${itemTotal}`);
-    lines.push('PACKING    : FREE');
-    lines.push('DELIVERY   : FREE');
-    if (gst > 0) lines.push(`TAXES/GST  : ₹${gst}`);
-    lines.push(`BHIM OFF   : -₹${bhimDiscount} (BHIMNEW)`);
-    if (referDiscount > 0) lines.push(`REFER CASH : -₹${referDiscount}`);
-    lines.push('----------------------');
-    lines.push(`FINAL PAY  : ₹${toPay}`);
-
-    await ctx.reply(mono(lines.join('\n')), {
+    await ctx.reply(mono(fallbackBill.text), {
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [
@@ -1277,32 +1294,43 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
       bypassBillMatch: true
     };
 
-    const toPay = Number(s.currentToPay || 1);
-    const orderId = `2599${Date.now().toString().slice(-8)}${Math.floor(100 + Math.random() * 900)}`;
-    let upiUrl = `upi://pay?pa=swiggy1online.gpay@okpayaxis&pn=SWIGGY%20TOING&tr=${orderId}&am=${toPay.toFixed(2)}&cu=INR&mc=5812`;
-    let activeOrderId = orderId;
+    const expectedToPay = Number(s.expectedPayable || s.currentToPay || 1);
+    let activeOrderId = null;
+    let upiUrl = null;
 
-    try {
-      const realQr = await generateRealSwiggyMerchantUpiQr(s.account, orderPayload);
-      if (realQr?.upiIntentUrl) {
-        let uStr = realQr.upiIntentUrl;
-        try {
-          const u = new URL(uStr);
-          u.searchParams.set('am', toPay.toFixed(2));
-          u.searchParams.set('amount', toPay.toFixed(2));
-          uStr = u.toString();
-        } catch {}
-        upiUrl = uStr;
-        if (realQr.swiggyOrderId) activeOrderId = realQr.swiggyOrderId;
-        if (realQr.paymentTxnId) s.currentPaymentTxnId = realQr.paymentTxnId;
+    // Fail closed: Real gateway QR must come from Swiggy merchant order/place
+    const realQr = await generateRealSwiggyMerchantUpiQr(s.account, orderPayload);
+    if (!realQr?.upiIntentUrl) {
+      throw new Error('Swiggy gateway did not return a valid UPI intent URL.');
+    }
+
+    upiUrl = realQr.upiIntentUrl;
+    activeOrderId = realQr.swiggyOrderId || orderPayload.id;
+
+    // Extract gateway amount without rewriting searchParams
+    let gatewayAmount = Number(realQr.amount);
+    if (!Number.isFinite(gatewayAmount) || gatewayAmount <= 0) {
+      try {
+        const u = new URL(upiUrl);
+        const amVal = u.searchParams.get('am') || u.searchParams.get('amount');
+        if (amVal) gatewayAmount = Number(amVal);
+      } catch (_) {}
+    }
+
+    // Fail closed on amount mismatch: stop overwriting am/amount
+    if (expectedToPay > 0 && Number.isFinite(gatewayAmount) && gatewayAmount > 0) {
+      if (Math.abs(gatewayAmount - expectedToPay) > 0.05) {
+        const mismatchErr = new Error(`Gateway amount mismatch: gateway ₹${gatewayAmount} != expected ₹${expectedToPay}`);
+        mismatchErr.name = 'QR_AMOUNT_MISMATCH';
+        mismatchErr.code = 'QR_AMOUNT_MISMATCH';
+        throw mismatchErr;
       }
-    } catch (e) {
-      console.warn('[Real QR Fallback to Toing UPI Intent]', e.message);
     }
 
     await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
     s.currentOrderId = activeOrderId;
     s.currentUpiUri = upiUrl;
+    s.currentPaymentTxnId = realQr.paymentTxnId || '';
     s.currentQrCreatedAt = Date.now();
     s.paymentAttempts = 0;
     s.paymentVerified = false;
@@ -1310,12 +1338,24 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
     s.paidOrderId = null;
 
     try {
-      const qrBuffer = await QRCode.toBuffer(upiUrl, {
-        type: 'png',
-        width: 450,
-        margin: 2,
-        errorCorrectionLevel: 'M'
-      });
+      let qrBuffer = null;
+      try {
+        qrBuffer = await generatePersonalizedQrCard({
+          customerName: s.account?.phone ? maskPhoneStars(s.account.phone) : 'Swiggy User',
+          restaurantName: s.restaurant.name,
+          amount: gatewayAmount || expectedToPay,
+          savings: Number(s.liveCart?.totalSavings || 0),
+          upiUrl
+        });
+      } catch (renderErr) {
+        console.warn('[FALLBACK] Puppeteer card render unavailable:', renderErr.message);
+        qrBuffer = await QRCode.toBuffer(upiUrl, {
+          type: 'png',
+          width: 450,
+          margin: 2,
+          errorCorrectionLevel: 'M'
+        });
+      }
 
       const captionLines = [
         'TOING OFFICIAL PAYMENT QR',

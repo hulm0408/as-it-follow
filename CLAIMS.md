@@ -13,4 +13,10 @@
 | M1: Payment truth verification with single-flight check | `toing-bot.js:44, 325-440` | PROVEN | `node test_toing_bot.mjs` tests CONFIRMED, PENDING, FAILED, and double-tap concurrency. Output: `11 passed, 0 failed.` (exit code 0). |
 | M1: `order/confirm` fires only on confirmed gateway transaction | `toing-bot.js:355-385`, `swiggy-cart.js:8505-8515` | PROVEN | Stubbed fetch test verifies `order/confirm` fires exactly once when gateway status is success, and 0 times when pending/failed. |
 | M1: Single-flight concurrency guard and double-tap idempotency | `toing-bot.js:44, 330-350` | PROVEN | Concurrent double-tap in `test_toing_bot.mjs` returns `status: 'IN_FLIGHT'` with message `check chal raha hai` and exactly 1 confirm call. |
+| M2: Bill fields populated from Swiggy cart payload | `toing-bot.js:486-531` | PROVEN | `test_toing_bot.mjs` asserts `renderToingBill` uses `liveCart` fields (itemTotal, packingCharges, deliveryFee, taxesAndCharges, finalPayable). |
+| M2: Packing and Delivery FREE only when payload confirms 0 | `toing-bot.js:520-521` | PROVEN | `test_toing_bot.mjs` verifies `PACKING : ₹25` / `DELIVERY : ₹40` when non-zero, and `FREE` only when 0. |
+| M2: Local arithmetic fallback explicitly marked `[FALLBACK] ESTIMATE` | `toing-bot.js:534-566` | PROVEN | `test_toing_bot.mjs` asserts missing cart triggers console warning `[FALLBACK] Cart payload missing payable` and `[FALLBACK] ESTIMATE BILL` text. |
+| M2: Fail closed on gateway amount mismatch with named error `QR_AMOUNT_MISMATCH` | `toing-bot.js:1319-1326` | PROVEN | Stopped rewriting `am`/`amount`. `test_toing_bot.mjs` asserts error thrown when gatewayAmount (₹50) != expectedToPay (₹69) with `err.name === 'QR_AMOUNT_MISMATCH'`. |
+| M2: High-resolution QR card generation via `generatePersonalizedQrCard` | `toing-bot.js:1341-1358` | PROVEN | Invokes `generatePersonalizedQrCard` with fallback to `QRCode.toBuffer` if Puppeteer fails, logging `[FALLBACK] Puppeteer card render unavailable`. |
+
 

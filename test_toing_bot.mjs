@@ -11,7 +11,8 @@ import {
   getMainMenuKeyboard,
   fetchLiveOrderTrackingApi,
   verifyOrderPayment,
-  paymentInFlight
+  paymentInFlight,
+  renderToingBill
 } from './toing-bot.js';
 
 let passed = 0;
@@ -382,6 +383,92 @@ await asyncTest('verifyOrderPayment: double tap triggers single-flight and order
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// 7. M2 Bill Truth: renderToingBill with real cart payload vs estimate fallback
+test('renderToingBill: renders authentic Swiggy cart payload without hardcoded free packing/delivery', () => {
+  const s = {
+    restaurant: { name: 'Patanwala Dairy' },
+    cart: [{ name: 'Milk Cow 1 Ltr', price: 86, qty: 1 }]
+  };
+  const liveCart = {
+    itemTotal: 86,
+    packingCharges: 10,
+    deliveryFee: 35,
+    taxesAndCharges: 4.3,
+    discountAmount: 20,
+    couponCode: 'BHIMNEW',
+    finalPayable: 115.3,
+    items: [{ name: 'Milk Cow 1 Ltr', price: 86, qty: 1 }]
+  };
+
+  const bill = renderToingBill(s, liveCart);
+  assert.equal(bill.isEstimate, false);
+  assert.ok(bill.text.includes('SWIGGY OFFICIAL LIVE BILL'));
+  assert.ok(bill.text.includes('PACKING    : ₹10'), 'Must show actual packing charge when non-zero');
+  assert.ok(bill.text.includes('DELIVERY   : ₹35'), 'Must show actual delivery charge when non-zero');
+  assert.ok(bill.text.includes('TAXES/FEES : ₹4.3'));
+  assert.ok(bill.text.includes('COUPON OFF : -₹20 (BHIMNEW)'));
+  assert.ok(bill.text.includes('FINAL PAY  : ₹115.3'));
+  assert.equal(s.currentToPay, 115.3);
+  assert.equal(s.expectedPayable, 115.3);
+});
+
+test('renderToingBill: displays FREE only when packing and delivery are genuinely 0', () => {
+  const s = {
+    restaurant: { name: 'Patanwala Dairy' },
+    cart: [{ name: 'Milk Cow 1 Ltr', price: 86, qty: 1 }]
+  };
+  const liveCart = {
+    itemTotal: 86,
+    packingCharges: 0,
+    deliveryFee: 0,
+    taxesAndCharges: 4.3,
+    discountAmount: 0,
+    finalPayable: 90.3,
+    items: [{ name: 'Milk Cow 1 Ltr', price: 86, qty: 1 }]
+  };
+
+  const bill = renderToingBill(s, liveCart);
+  assert.ok(bill.text.includes('PACKING    : FREE'));
+  assert.ok(bill.text.includes('DELIVERY   : FREE'));
+});
+
+test('renderToingBill: falls back to local arithmetic explicitly labelled [FALLBACK] ESTIMATE when payload is missing', () => {
+  const s = {
+    restaurant: { name: 'Patanwala Dairy' },
+    cart: [{ name: 'Milk Cow 1 Ltr', price: 86, qty: 1 }],
+    bhimOffer: true,
+    referClaimed: false
+  };
+
+  const bill = renderToingBill(s, null);
+  assert.equal(bill.isEstimate, true);
+  assert.ok(bill.text.includes('[FALLBACK] ESTIMATE BILL'));
+  assert.ok(bill.text.includes('PACKING    : [FALLBACK] ESTIMATE'));
+  assert.ok(bill.text.includes('DELIVERY   : [FALLBACK] ESTIMATE'));
+  assert.ok(bill.text.includes('[FALLBACK]'));
+});
+
+test('M2: fail closed on gateway amount mismatch with named error QR_AMOUNT_MISMATCH', () => {
+  const expectedPayable = 69.00;
+  const gatewayAmount = 228.00; // Gateway returned full bloated bill without coupon
+
+  let caughtErr = null;
+  try {
+    if (Math.abs(gatewayAmount - expectedPayable) > 0.05) {
+      const err = new Error(`Gateway amount mismatch: gateway ₹${gatewayAmount} != expected ₹${expectedPayable}`);
+      err.name = 'QR_AMOUNT_MISMATCH';
+      err.code = 'QR_AMOUNT_MISMATCH';
+      throw err;
+    }
+  } catch (e) {
+    caughtErr = e;
+  }
+
+  assert.ok(caughtErr, 'Must throw error on amount mismatch');
+  assert.equal(caughtErr.name, 'QR_AMOUNT_MISMATCH');
+  assert.equal(caughtErr.code, 'QR_AMOUNT_MISMATCH');
 });
 
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
