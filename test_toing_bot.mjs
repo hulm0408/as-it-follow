@@ -940,6 +940,39 @@ test('M7: render.yaml contains only active variables and all exist in .env.examp
   }
 });
 
+// --- M8: RUNBOOK VALIDATION TESTS ---
+
+test('M8: RUNBOOK.md exists and contains all required live steps, failure matrix, and admin procedures', () => {
+  const runbookPath = path.join(process.cwd(), 'RUNBOOK.md');
+  assert.ok(fs.existsSync(runbookPath), 'RUNBOOK.md must exist in root directory');
+
+  const content = fs.readFileSync(runbookPath, 'utf8');
+
+  // Verify all 7 steps are documented with exact outputs
+  assert.ok(content.includes('Step 1: Start & Authorization Check'));
+  assert.ok(content.includes('Step 2: Session Login & Free Cash Inspection'));
+  assert.ok(content.includes('Step 3: Delivery Address Configuration'));
+  assert.ok(content.includes('Step 4: Restaurant & Dish Selection'));
+  assert.ok(content.includes('Step 5: Checkout & Live Bill Generation'));
+  assert.ok(content.includes('Step 6: Payment Verification & Live Tracking'));
+  assert.ok(content.includes('Step 7: Order Cancellation Flow'));
+
+  // Verify exact failure remediation matrix
+  assert.ok(content.includes('Live Failure Modes & Remediation Matrix'));
+  assert.ok(content.includes('SWIGGY_SECURITY_CHALLENGE'));
+  assert.ok(content.includes('QR_AMOUNT_MISMATCH'));
+  assert.ok(content.includes('TOO_LATE_TO_CANCEL'));
+  assert.ok(content.includes('RATE LIMIT EXCEEDED'));
+  assert.ok(content.includes('FILE TOO LARGE'));
+
+  // Verify required migration note
+  assert.ok(content.includes('accounts must be re-uploaded once after M4 restart'));
+
+  // Verify operational administration commands
+  assert.ok(content.includes('ALLOWED_USER_IDS'));
+  assert.ok(content.includes('state.json'));
+});
+
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);

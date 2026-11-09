@@ -39,6 +39,8 @@
 | M7: Comprehensive `.env.example` template | `.env.example:1-30` | PROVEN | Created `.env.example` covering all active configuration variables (`BOT_TOKEN`, `ALLOWED_USER_IDS`, `BOSS_ID`, `DATA_DIR`, `PERSISTENCE_SECRET`). |
 | M7: `render.yaml` environment variables cross-validated against `.env.example` | `test_toing_bot.mjs` | PROVEN | Unit test asserts every variable defined in `render.yaml` exists in `.env.example`. |
 | M7: Optional lightweight HTTP `/health` server for web service compatibility | `index.js:8-23` | PROVEN | Mounts HTTP server responding on `GET /health` with `{ status: 'ok', uptime }` only when `PORT` is defined, preserving polling. |
+| M8: Comprehensive operational runbook with zero-padding | `RUNBOOK.md:1-180` | PROVEN | `test_toing_bot.mjs` verifies presence of all 7 live steps, exact outputs, failure matrix (WAF, mismatch, cancel, rate limit, upload cap), and operational procedures. |
+
 
 
 
