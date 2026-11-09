@@ -12,6 +12,9 @@
 // - Zero fake dummy fallbacks
 // ============================================================================
 
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import QRCode from 'qrcode';
 import { extractSharedUrls, normalizeSharedUrl } from './link-utils.js';
 import {
@@ -44,6 +47,213 @@ const userState = new Map();
 
 // In-flight payment verification tracker (single-flight per orderId)
 export const paymentInFlight = new Set();
+
+function getDerivedEncryptionKey() {
+  const secret = process.env.PERSISTENCE_SECRET || process.env.BOT_TOKEN || 'toing-bot-default-persistence-key-2026';
+  return crypto.scryptSync(secret, 'toing-state-salt', 32);
+}
+
+export function encryptAccount(account) {
+  if (!account) return null;
+  try {
+    const iv = crypto.randomBytes(12);
+    const key = getDerivedEncryptionKey();
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const plaintext = JSON.stringify(account);
+    const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    return {
+      iv: iv.toString('hex'),
+      tag: authTag.toString('hex'),
+      data: encrypted.toString('hex')
+    };
+  } catch (err) {
+    console.warn('[FALLBACK] Account encryption failed:', err.message);
+    return null;
+  }
+}
+
+export function decryptAccount(enc) {
+  if (!enc || typeof enc !== 'object' || !enc.iv || !enc.tag || !enc.data) return null;
+  try {
+    const key = getDerivedEncryptionKey();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(enc.iv, 'hex'));
+    decipher.setAuthTag(Buffer.from(enc.tag, 'hex'));
+    const decrypted = Buffer.concat([
+      decipher.update(Buffer.from(enc.data, 'hex')),
+      decipher.final()
+    ]);
+    return JSON.parse(decrypted.toString('utf8'));
+  } catch (err) {
+    console.warn('[FALLBACK] Failed to decrypt account credentials, resetting account:', err.message);
+    return null;
+  }
+}
+
+export function getDefaultStateFilePath() {
+  if (process.env.STATE_FILE_PATH) return process.env.STATE_FILE_PATH;
+  if (process.env.DATA_DIR) return path.join(process.env.DATA_DIR, 'state.json');
+  if (fs.existsSync('/app/data')) return '/app/data/state.json';
+  return path.join(process.cwd(), 'data', 'state.json');
+}
+
+export function serializeState(now = Date.now(), maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
+  const serialized = {};
+
+  for (const [userId, s] of userState.entries()) {
+    const lastActive = Number(s.lastActivityAt || now);
+    if (now - lastActive > maxAgeMs) {
+      continue; // Prune inactive users
+    }
+
+    serialized[userId] = {
+      userId,
+      step: s.step || 'IDLE',
+      accountEncrypted: encryptAccount(s.account),
+      address: s.address || null,
+      addressLink: s.addressLink || null,
+      lat: s.lat || null,
+      lng: s.lng || null,
+      restaurant: s.restaurant || null,
+      cart: Array.isArray(s.cart) ? s.cart : [],
+      savedCart: Array.isArray(s.savedCart) ? s.savedCart : [],
+      bhimOffer: Boolean(s.bhimOffer),
+      referClaimed: Boolean(s.referClaimed),
+      freeCashAmount: Number(s.freeCashAmount || 0),
+      currentOrderId: s.currentOrderId || null,
+      currentUpiUri: s.currentUpiUri || null,
+      currentPaymentTxnId: s.currentPaymentTxnId || null,
+      currentQrCreatedAt: s.currentQrCreatedAt || null,
+      paymentAttempts: Number(s.paymentAttempts || 0),
+      paymentVerified: Boolean(s.paymentVerified),
+      paidAt: s.paidAt || null,
+      paidOrderId: s.paidOrderId || null,
+      currentToPay: Number(s.currentToPay || 0),
+      expectedPayable: Number(s.expectedPayable || 0),
+      lastActivityAt: lastActive
+    };
+  }
+
+  return {
+    version: 1,
+    savedAt: now,
+    users: serialized
+  };
+}
+
+export function saveStateToDisk(filePath = null) {
+  const targetPath = filePath || getDefaultStateFilePath();
+  const dir = path.dirname(targetPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  const payload = serializeState();
+  const jsonStr = JSON.stringify(payload, null, 2);
+
+  const tmpPath = `${targetPath}.tmp.${Date.now()}.${Math.floor(Math.random() * 10000)}`;
+  fs.writeFileSync(tmpPath, jsonStr, 'utf8');
+
+  try {
+    fs.renameSync(tmpPath, targetPath);
+  } catch (renameErr) {
+    try {
+      fs.copyFileSync(tmpPath, targetPath);
+      fs.unlinkSync(tmpPath);
+    } catch (fallbackErr) {
+      console.warn('[FALLBACK] Atomic replace fallback on Windows:', fallbackErr.message);
+      fs.writeFileSync(targetPath, jsonStr, 'utf8');
+      try { fs.unlinkSync(tmpPath); } catch (_) {}
+    }
+  }
+
+  return true;
+}
+
+export function loadStateFromDisk(filePath = null) {
+  const targetPath = filePath || getDefaultStateFilePath();
+  if (!fs.existsSync(targetPath)) {
+    return false;
+  }
+
+  let raw = '';
+  try {
+    raw = fs.readFileSync(targetPath, 'utf8');
+  } catch (readErr) {
+    console.warn('[FALLBACK] Could not read state file:', readErr.message);
+    return false;
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (jsonErr) {
+    const backupPath = `${targetPath}.corrupt.${Date.now()}`;
+    console.warn(`[FALLBACK] Corrupted state.json detected. Backing up to ${backupPath} and initializing fresh state.`);
+    try {
+      fs.renameSync(targetPath, backupPath);
+    } catch (_) {
+      try {
+        fs.copyFileSync(targetPath, backupPath);
+        fs.unlinkSync(targetPath);
+      } catch (_) {}
+    }
+    userState.clear();
+    return false;
+  }
+
+  const now = Date.now();
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+  const users = parsed?.users || {};
+
+  userState.clear();
+  for (const [userId, u] of Object.entries(users)) {
+    const lastActive = Number(u.lastActivityAt || parsed.savedAt || now);
+    if (now - lastActive > SEVEN_DAYS_MS) {
+      continue;
+    }
+
+    const stateObj = {
+      step: u.step || 'IDLE',
+      account: decryptAccount(u.accountEncrypted),
+      referClaimed: Boolean(u.referClaimed),
+      bhimOffer: u.bhimOffer !== undefined ? Boolean(u.bhimOffer) : true,
+      freeCashAmount: Number(u.freeCashAmount || 0),
+      appliedCoupon: null,
+      address: u.address || null,
+      addressLink: u.addressLink || null,
+      lat: u.lat || null,
+      lng: u.lng || null,
+      restaurant: u.restaurant || null,
+      menuData: null,
+      cart: Array.isArray(u.cart) ? u.cart : [],
+      savedCart: Array.isArray(u.savedCart) ? u.savedCart : [],
+      savedRestaurant: null,
+      lastCandidateAccount: null,
+      lastCandidateDocMsgId: null,
+      lastCandidateChatId: null,
+      liveCart: null,
+      pendingOutlets: [],
+      pendingDishes: [],
+      currentOrderId: u.currentOrderId || null,
+      currentUpiUri: u.currentUpiUri || null,
+      currentPaymentTxnId: u.currentPaymentTxnId || null,
+      currentQrCreatedAt: u.currentQrCreatedAt || null,
+      paymentAttempts: Number(u.paymentAttempts || 0),
+      paymentVerified: Boolean(u.paymentVerified),
+      paidAt: u.paidAt || null,
+      paidOrderId: u.paidOrderId || null,
+      currentToPay: Number(u.currentToPay || 0),
+      expectedPayable: Number(u.expectedPayable || 0),
+      lastActivityAt: lastActive,
+      isCancelling: false
+    };
+
+    userState.set(String(userId), stateObj);
+  }
+
+  return true;
+}
 
 export function getState(userId) {
   const key = String(userId);
@@ -78,10 +288,14 @@ export function getState(userId) {
       paidAt: null,
       paidOrderId: null,
       currentToPay: 0,
-      currentUpiUri: null
+      currentUpiUri: null,
+      lastActivityAt: Date.now(),
+      isCancelling: false
     });
   }
-  return userState.get(key);
+  const s = userState.get(key);
+  s.lastActivityAt = Date.now();
+  return s;
 }
 
 function mono(text) {
@@ -751,8 +965,50 @@ export async function cancelOrder(account, orderId, reason = 'User requested can
 
 
 export function setupToingBot(bot) {
+  // Hydrate persistence on boot
+  loadStateFromDisk();
+
+  // Periodic persistence flush (every 30s)
+  const saveTimer = setInterval(() => {
+    try { saveStateToDisk(); } catch (_) {}
+  }, 30000);
+  if (saveTimer.unref) saveTimer.unref();
+
+  process.once('SIGINT', () => { try { saveStateToDisk(); } catch (_) {} });
+  process.once('SIGTERM', () => { try { saveStateToDisk(); } catch (_) {} });
+
   // 1. /start
   bot.command('start', async (ctx) => {
+    const s = getState(ctx.from.id);
+
+    // On restart: resume pending unpaid order with retry button intact
+    if (s.currentOrderId && !s.paymentVerified && s.currentUpiUri) {
+      await ctx.reply(mono(`PENDING UNPAID ORDER RESUMED\n----------------------\nORDER ID : #${s.currentOrderId}\nAMOUNT   : ₹${s.currentToPay || s.expectedPayable || 0}\nSTATUS   : AWAITING PAYMENT\n----------------------\nYou have an unfinished order from your previous session.\nTap below to verify payment or cancel.`), {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '🔄 CHECK PAYMENT', callback_data: `tb_paid_${s.currentOrderId}` },
+              { text: '❌ CANCEL ORDER', callback_data: 'tb_cancel_order' }
+            ],
+            [
+              { text: '🏠 GO TO MAIN MENU', callback_data: 'tb_dashboard' }
+            ]
+          ]
+        }
+      });
+      return;
+    }
+
+    s.step = 'IDLE';
+    await ctx.reply(formatDashboard(s), {
+      parse_mode: 'HTML',
+      ...getMainMenuKeyboard(s)
+    });
+  });
+
+  bot.action('tb_dashboard', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
     const s = getState(ctx.from.id);
     s.step = 'IDLE';
     await ctx.reply(formatDashboard(s), {

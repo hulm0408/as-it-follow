@@ -4,6 +4,8 @@
 // ============================================================================
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import QRCode from 'qrcode';
 import {
   getState,
@@ -13,7 +15,12 @@ import {
   verifyOrderPayment,
   paymentInFlight,
   renderToingBill,
-  cancelOrder
+  cancelOrder,
+  saveStateToDisk,
+  loadStateFromDisk,
+  encryptAccount,
+  decryptAccount,
+  serializeState
 } from './toing-bot.js';
 
 let passed = 0;
@@ -651,6 +658,137 @@ test('cancelOrder: double-cancel guard prevents race condition', () => {
   }
 
   assert.equal(doubleCancelBlocked, true, 'Subsequent cancel click must be blocked by isCancelling guard');
+});
+
+// --- M4: PERSISTENCE TESTS ---
+
+test('M4: account encryption and decryption round-trip', () => {
+  const mockAccount = {
+    phone: '9876543210',
+    customerId: '123456',
+    token: 'super_secret_jwt_token_swiggy',
+    cookies: 'tid=token123; _session_tid=secret_sess_456'
+  };
+
+  const encrypted = encryptAccount(mockAccount);
+  assert.ok(encrypted.iv);
+  assert.ok(encrypted.tag);
+  assert.ok(encrypted.data);
+
+  // Assert sensitive secrets are NOT stored in plaintext
+  assert.ok(!JSON.stringify(encrypted).includes('super_secret_jwt_token_swiggy'));
+  assert.ok(!JSON.stringify(encrypted).includes('secret_sess_456'));
+
+  const decrypted = decryptAccount(encrypted);
+  assert.deepEqual(decrypted, mockAccount);
+});
+
+test('M4: save -> reload -> assert matching state with encrypted account and active order', () => {
+  const testStateFile = path.join(process.cwd(), 'data', 'test_state_m4.json');
+
+  // Clean up any old test file
+  try { fs.unlinkSync(testStateFile); } catch (_) {}
+
+  const uId = '999888111';
+  const s = getState(uId);
+  s.account = {
+    phone: '9111122222',
+    token: 'secret_live_token',
+    cookies: 'tid=abc; _session_tid=xyz'
+  };
+  s.address = { name: 'Home', address: 'Hazratganj, Lucknow' };
+  s.cart = [{ name: 'Kebab Paratha', price: 120, qty: 2 }];
+  s.savedCart = [{ name: 'Kebab Paratha', price: 120, qty: 2 }];
+  s.step = 'AWAITING_PAYMENT';
+  s.currentOrderId = 'SWIGGY_ORD_777';
+  s.currentUpiUri = 'upi://pay?pa=swiggy@icici&am=240';
+  s.paymentVerified = false;
+  s.currentToPay = 240;
+
+  // Save to disk
+  saveStateToDisk(testStateFile);
+  assert.ok(fs.existsSync(testStateFile), 'State file must be written to disk');
+
+  // Verify file on disk has encrypted credentials, not plaintext
+  const rawDisk = fs.readFileSync(testStateFile, 'utf8');
+  assert.ok(!rawDisk.includes('secret_live_token'), 'Account token must not be plaintext on disk');
+
+  // Load from disk
+  const loaded = loadStateFromDisk(testStateFile);
+  assert.equal(loaded, true);
+
+  const restored = getState(uId);
+  assert.equal(restored.step, 'AWAITING_PAYMENT');
+  assert.equal(restored.currentOrderId, 'SWIGGY_ORD_777');
+  assert.equal(restored.currentUpiUri, 'upi://pay?pa=swiggy@icici&am=240');
+  assert.equal(restored.paymentVerified, false);
+  assert.equal(restored.currentToPay, 240);
+  assert.equal(restored.address.name, 'Home');
+  assert.equal(restored.cart.length, 1);
+  assert.equal(restored.cart[0].name, 'Kebab Paratha');
+  assert.equal(restored.cart[0].qty, 2);
+  assert.equal(restored.savedCart.length, 1);
+  assert.equal(restored.account.phone, '9111122222');
+  assert.equal(restored.account.token, 'secret_live_token');
+
+  // Clean up
+  try { fs.unlinkSync(testStateFile); } catch (_) {}
+});
+
+test('M4: corrupted state file triggers backup + fresh state initialization', () => {
+  const corruptFile = path.join(process.cwd(), 'data', 'test_corrupt_state.json');
+  fs.mkdirSync(path.dirname(corruptFile), { recursive: true });
+  fs.writeFileSync(corruptFile, '{ THIS IS NOT VALID JSON: 1234 }', 'utf8');
+
+  // Call loadStateFromDisk
+  const loadResult = loadStateFromDisk(corruptFile);
+  assert.equal(loadResult, false, 'Corrupted file must return false');
+
+  // Verify fresh state (state initialized empty)
+  const freshUser = getState('new_user_after_corruption');
+  assert.equal(freshUser.step, 'IDLE');
+  assert.equal(freshUser.cart.length, 0);
+
+  // Verify backup file exists
+  const filesInDir = fs.readdirSync(path.dirname(corruptFile));
+  const backupFiles = filesInDir.filter(f => f.startsWith('test_corrupt_state.json.corrupt.'));
+  assert.ok(backupFiles.length > 0, 'Backup corrupt file must be created on disk');
+
+  // Clean up
+  for (const f of backupFiles) {
+    try { fs.unlinkSync(path.join(path.dirname(corruptFile), f)); } catch (_) {}
+  }
+  try { fs.unlinkSync(corruptFile); } catch (_) {}
+});
+
+test('M4: prune users inactive for > 7 days', () => {
+  const pruneFile = path.join(process.cwd(), 'data', 'test_prune_state.json');
+  const now = Date.now();
+  const eightDaysAgo = now - (8 * 24 * 60 * 60 * 1000);
+  const oneDayAgo = now - (1 * 24 * 60 * 60 * 1000);
+
+  // User 1: inactive 8 days ago
+  const uOld = getState('old_user_8d');
+  uOld.lastActivityAt = eightDaysAgo;
+  uOld.cart = [{ name: 'Old Dish', price: 50, qty: 1 }];
+
+  // User 2: active 1 day ago
+  const uRecent = getState('recent_user_1d');
+  uRecent.lastActivityAt = oneDayAgo;
+  uRecent.cart = [{ name: 'Fresh Dish', price: 100, qty: 1 }];
+
+  saveStateToDisk(pruneFile);
+
+  // Reload state
+  loadStateFromDisk(pruneFile);
+
+  // Check serialization payload
+  const rawDisk = JSON.parse(fs.readFileSync(pruneFile, 'utf8'));
+  assert.ok(!rawDisk.users['old_user_8d'], 'User inactive for 8 days must be pruned');
+  assert.ok(rawDisk.users['recent_user_1d'], 'User active 1 day ago must be preserved');
+
+  // Clean up
+  try { fs.unlinkSync(pruneFile); } catch (_) {}
 });
 
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);

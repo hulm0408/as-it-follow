@@ -22,6 +22,12 @@
 | M3: Too-late cancellation from Swiggy keeps order retryable | `toing-bot.js:705, 1780-1795` | PROVEN | `test_toing_bot.mjs` verifies non-cancellable responses return `TOO_LATE_TO_CANCEL` and do not clear local order or cart state. |
 | M3: Confirmed cancel restores `s.cart` from `s.savedCart` and clears active order | `toing-bot.js:1819-1836` | PROVEN | `test_toing_bot.mjs` asserts successful cancel resets `currentOrderId` to null and restores all items from `savedCart`. |
 | M3: Double-cancel guard and confirmation step | `toing-bot.js:1745-1775` | PROVEN | Two-step prompt with `tb_cancel_confirm_${orderId}` and `s.isCancelling` guard verified by unit tests. |
+| M4: Atomic disk persistence via tmp write and rename | `toing-bot.js:130-175` | PROVEN | `test_toing_bot.mjs` tests saving to disk and loading, verifying data integrity across restarts. |
+| M4: AES-256-GCM account credential encryption at rest | `toing-bot.js:55-95` | PROVEN | `test_toing_bot.mjs` asserts session tokens and cookies are encrypted with AES-256-GCM and not readable in plaintext on disk. |
+| M4: Corrupted state file detection and automated backup | `toing-bot.js:185-205` | PROVEN | `test_toing_bot.mjs` feeds invalid JSON to `loadStateFromDisk`, verifies `.corrupt.<timestamp>` backup created and state initialized cleanly. |
+| M4: 7-day inactive user pruning | `toing-bot.js:105-115, 205-215` | PROVEN | `test_toing_bot.mjs` verifies user with activity > 7 days ago is pruned while active user is preserved. |
+| M4: Unfinished pending unpaid order resumed on boot | `toing-bot.js:1020-1045` | PROVEN | `/start` detects unverified pending order with UPI URL and displays resume card with retry buttons. |
+
 
 
 
