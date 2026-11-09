@@ -29,7 +29,8 @@ import {
   dapiFetch,
   applyLiveCouponToOrder,
   checkRealSwiggyPaymentAndExtractTracking,
-  extractRealSwiggyTracking
+  extractRealSwiggyTracking,
+  getSwiggySessionAuth
 } from './swiggy-cart.js';
 import { claimSwiggyBreakfastAndLateNightOffers } from './swiggy-bridge.js';
 import {
@@ -667,6 +668,87 @@ export async function verifyOrderPayment(account, orderId, paymentTxnId, state =
     paymentInFlight.delete(targetId);
   }
 }
+
+/**
+ * Cancels active pending Swiggy order using DAPI cancel route with chkout fallback.
+ * Checks for non-cancellable / "too late" status from Swiggy to prevent silent desync.
+ */
+export async function cancelOrder(account, orderId, reason = 'User requested cancellation') {
+  if (!orderId) {
+    return { success: false, reason: 'NO_ORDER_ID', message: 'No active order ID to cancel' };
+  }
+
+  const payload = {
+    order_id: String(orderId),
+    cancellation_reason: reason,
+    reason: reason
+  };
+
+  // Route 1: DAPI cancel route
+  try {
+    const dapiRaw = await dapiFetch(account, 'order/cancel', {
+      method: 'POST',
+      body: payload,
+      extraHeaders: { 'content-type': 'application/json' },
+      timeoutMs: 10000
+    });
+
+    const dapiRes = dapiRaw?.json || dapiRaw;
+    if (dapiRes && (dapiRes.statusCode === 0 || dapiRes.status === 200 || dapiRes.data?.status === 'success' || dapiRes.statusMessage === 'Order cancelled successfully')) {
+      return { success: true, source: 'dapi', data: dapiRes.data || dapiRes };
+    }
+
+    const statusMsg = String(dapiRes?.statusMessage || dapiRes?.message || dapiRes?.data?.message || '');
+    if (/too late|cannot be cancelled|already (?:placed|prepared|dispatched|delivered)|not cancellable|cancellation window/i.test(statusMsg)) {
+      return { success: false, reason: 'TOO_LATE_TO_CANCEL', message: statusMsg || 'Too late to cancel on Swiggy' };
+    }
+  } catch (dapiErr) {
+    console.warn('[FALLBACK] DAPI order/cancel failed, attempting chkout fallback:', dapiErr.message);
+  }
+
+  // Route 2: Chkout cancel route fallback
+  try {
+    const auth = await getSwiggySessionAuth(account).catch(() => ({}));
+    const chkoutUrl = 'https://chkout.swiggy.com/api/v2/order/cancel';
+    const chkoutRes = await fetch(chkoutUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'cookie': auth?.cookie || '',
+        '__fetch_req__': 'true',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const chkoutText = await chkoutRes.text();
+    let chkoutJson = {};
+    try { chkoutJson = JSON.parse(chkoutText); } catch (_) {}
+
+    if (chkoutRes.ok && (chkoutJson.statusCode === 0 || chkoutJson.status === 'success' || chkoutJson.data?.status === 'success')) {
+      return { success: true, source: 'chkout', data: chkoutJson };
+    }
+
+    const errorMsg = String(chkoutJson.statusMessage || chkoutJson.message || chkoutText || '');
+    if (chkoutRes.status === 400 || /too late|cannot be cancelled|already (?:placed|prepared|dispatched|delivered)|not cancellable/i.test(errorMsg)) {
+      return { success: false, reason: 'TOO_LATE_TO_CANCEL', message: errorMsg || 'Too late to cancel on Swiggy' };
+    }
+
+    return {
+      success: false,
+      reason: 'CANCEL_FAILED',
+      message: errorMsg || `HTTP ${chkoutRes.status}`
+    };
+  } catch (chkoutErr) {
+    console.warn('[FALLBACK] Chkout cancel fallback threw error:', chkoutErr.message);
+    return {
+      success: false,
+      reason: 'CANCEL_NETWORK_ERROR',
+      message: chkoutErr.message
+    };
+  }
+}
+
 
 export function setupToingBot(bot) {
   // 1. /start
@@ -1652,13 +1734,143 @@ async function processAccountLoginWithFreeCashCheck(ctx, rawParsed, isDocument =
   });
 
   bot.action('tb_cancel_order', async (ctx) => {
-    await ctx.answerCbQuery('Order cancelled').catch(() => {});
+    await ctx.answerCbQuery().catch(() => {});
     const s = getState(ctx.from.id);
-    s.step = 'IDLE';
-    await ctx.reply(mono('ORDER CANCELLED'), {
+    const orderId = s.currentOrderId;
+
+    if (!orderId) {
+      s.step = 'IDLE';
+      await ctx.reply(mono('NO ACTIVE ORDER TO CANCEL\n----------------------\nCart items preserved.'), {
+        parse_mode: 'HTML',
+        ...getMainMenuKeyboard(s)
+      });
+      return;
+    }
+
+    if (s.paymentVerified) {
+      await ctx.reply(mono(`CANNOT CANCEL PAID ORDER\n----------------------\nOrder #${orderId} is confirmed and paid.\nPlease contact Swiggy support to request cancellation.`), {
+        parse_mode: 'HTML',
+        ...getMainMenuKeyboard(s)
+      });
+      return;
+    }
+
+    // Step 1: Confirm step
+    await ctx.reply(mono(`ARE YOU SURE YOU WANT TO CANCEL?\n----------------------\nORDER ID : #${orderId}\nAMOUNT   : ₹${s.currentToPay || s.expectedPayable || 0}\n\n⚠️ Cancelling will remove this pending order on Swiggy.\nCart items will be restored.`), {
       parse_mode: 'HTML',
-      ...getMainMenuKeyboard(s)
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '⚠️ CONFIRM CANCEL', callback_data: `tb_cancel_confirm_${orderId}` },
+            { text: '↩️ KEEP ORDER', callback_data: `tb_cancel_abort_${orderId}` }
+          ]
+        ]
+      }
     });
+  });
+
+  bot.action(/^tb_cancel_abort_(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery('Cancellation aborted').catch(() => {});
+    const s = getState(ctx.from.id);
+    await ctx.reply(mono(`ORDER KEPT\n----------------------\nOrder #${ctx.match[1]} remains active.\nUse 'I HAVE PAID' once payment is done.`), {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '✅ I HAVE PAID', callback_data: `tb_paid_${ctx.match[1]}` },
+            { text: '❌ CANCEL', callback_data: 'tb_cancel_order' }
+          ]
+        ]
+      }
+    });
+  });
+
+  bot.action(/^tb_cancel_confirm_(.+)$/, async (ctx) => {
+    const s = getState(ctx.from.id);
+    const targetOrderId = ctx.match[1];
+
+    // Double-cancel guard & idempotency check
+    if (s.isCancelling) {
+      await ctx.answerCbQuery('Cancel in progress, please wait...').catch(() => {});
+      return;
+    }
+    if (!s.currentOrderId || s.currentOrderId !== targetOrderId) {
+      await ctx.answerCbQuery('Order already cancelled or not active').catch(() => {});
+      return;
+    }
+    if (s.paymentVerified) {
+      await ctx.answerCbQuery('Order already verified paid!').catch(() => {});
+      return;
+    }
+
+    s.isCancelling = true;
+    await ctx.answerCbQuery('Cancelling on Swiggy...').catch(() => {});
+
+    try {
+      // Cancel on Swiggy FIRST if account and orderId exist
+      let cancelRes = { success: true };
+      if (s.account && s.currentOrderId) {
+        cancelRes = await cancelOrder(s.account, targetOrderId);
+      }
+
+      if (!cancelRes.success) {
+        s.isCancelling = false;
+        if (cancelRes.reason === 'TOO_LATE_TO_CANCEL') {
+          // Do NOT clear local state! Keep order retryable
+          await ctx.reply(mono(`SWIGGY CANCELLATION REJECTED\n----------------------\nSTATUS : TOO LATE TO CANCEL\nREASON : ${cancelRes.message || 'Restaurant has already prepared or dispatched order'}\n----------------------\nOrder #${targetOrderId} remains active.`), {
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: '🔄 CHECK PAYMENT', callback_data: `tb_paid_${targetOrderId}` },
+                  { text: '📊 TRACK ORDER', callback_data: `tb_track_${targetOrderId}` }
+                ]
+              ]
+            }
+          });
+          return;
+        }
+
+        // Generic failure
+        console.warn('[FALLBACK] Swiggy cancel failed:', cancelRes.message);
+        await ctx.reply(mono(`[FALLBACK] CANCEL FAILED ON SWIGGY\n----------------------\nREASON : ${cancelRes.message || 'Network error'}\n----------------------\nOrder #${targetOrderId} was NOT cancelled on Swiggy.\nState preserved for retry.`), {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '🔄 CHECK PAYMENT', callback_data: `tb_paid_${targetOrderId}` },
+                { text: '⚠️ FORCE RETRY CANCEL', callback_data: `tb_cancel_confirm_${targetOrderId}` }
+              ]
+            ]
+          }
+        });
+        return;
+      }
+
+      // Success: cancel confirmed on Swiggy -> restore cart from savedCart, clear local order state
+      if (Array.isArray(s.savedCart) && s.savedCart.length > 0) {
+        s.cart = [...s.savedCart];
+      }
+      const restoredCount = s.cart.length;
+      s.currentOrderId = null;
+      s.currentUpiUri = null;
+      s.currentPaymentTxnId = null;
+      s.currentQrCreatedAt = null;
+      s.paymentAttempts = 0;
+      s.step = 'IDLE';
+      s.isCancelling = false;
+
+      await ctx.reply(mono(`ORDER CANCELLED SUCCESSFULLY\n----------------------\nORDER ID : #${targetOrderId}\nSWIGGY   : CANCELLED (${cancelRes.source || 'api'})\nCART     : RESTORED (${restoredCount} items)\n----------------------\nYou can modify your cart or place a new order.`), {
+        parse_mode: 'HTML',
+        ...getMainMenuKeyboard(s)
+      });
+    } catch (err) {
+      s.isCancelling = false;
+      console.warn('[FALLBACK] Cancel handler threw exception:', err.message);
+      await ctx.reply(mono(`[FALLBACK] CANCELLATION ERROR\n----------------------\nERROR  : ${err.message}\nOrder state preserved.`), {
+        parse_mode: 'HTML'
+      });
+    }
   });
 
   // Outlet picker action: uses short index into s.pendingOutlets (< 15 bytes callback_data)

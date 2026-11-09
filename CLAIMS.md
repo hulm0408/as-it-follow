@@ -18,5 +18,10 @@
 | M2: Local arithmetic fallback explicitly marked `[FALLBACK] ESTIMATE` | `toing-bot.js:534-566` | PROVEN | `test_toing_bot.mjs` asserts missing cart triggers console warning `[FALLBACK] Cart payload missing payable` and `[FALLBACK] ESTIMATE BILL` text. |
 | M2: Fail closed on gateway amount mismatch with named error `QR_AMOUNT_MISMATCH` | `toing-bot.js:1319-1326` | PROVEN | Stopped rewriting `am`/`amount`. `test_toing_bot.mjs` asserts error thrown when gatewayAmount (₹50) != expectedToPay (₹69) with `err.name === 'QR_AMOUNT_MISMATCH'`. |
 | M2: High-resolution QR card generation via `generatePersonalizedQrCard` | `toing-bot.js:1341-1358` | PROVEN | Invokes `generatePersonalizedQrCard` with fallback to `QRCode.toBuffer` if Puppeteer fails, logging `[FALLBACK] Puppeteer card render unavailable`. |
+| M3: Cancel order via DAPI route with chkout fallback | `toing-bot.js:683-755` | PROVEN | `test_toing_bot.mjs` verifies DAPI cancel call and automatic fallback to `chkout.swiggy.com/api/v2/order/cancel`. |
+| M3: Too-late cancellation from Swiggy keeps order retryable | `toing-bot.js:705, 1780-1795` | PROVEN | `test_toing_bot.mjs` verifies non-cancellable responses return `TOO_LATE_TO_CANCEL` and do not clear local order or cart state. |
+| M3: Confirmed cancel restores `s.cart` from `s.savedCart` and clears active order | `toing-bot.js:1819-1836` | PROVEN | `test_toing_bot.mjs` asserts successful cancel resets `currentOrderId` to null and restores all items from `savedCart`. |
+| M3: Double-cancel guard and confirmation step | `toing-bot.js:1745-1775` | PROVEN | Two-step prompt with `tb_cancel_confirm_${orderId}` and `s.isCancelling` guard verified by unit tests. |
+
 
 

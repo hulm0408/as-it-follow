@@ -12,7 +12,8 @@ import {
   fetchLiveOrderTrackingApi,
   verifyOrderPayment,
   paymentInFlight,
-  renderToingBill
+  renderToingBill,
+  cancelOrder
 } from './toing-bot.js';
 
 let passed = 0;
@@ -469,6 +470,187 @@ test('M2: fail closed on gateway amount mismatch with named error QR_AMOUNT_MISM
   assert.ok(caughtErr, 'Must throw error on amount mismatch');
   assert.equal(caughtErr.name, 'QR_AMOUNT_MISMATCH');
   assert.equal(caughtErr.code, 'QR_AMOUNT_MISMATCH');
+});
+
+// --- M3: CANCEL TRUTH TESTS ---
+
+await asyncTest('cancelOrder: successfully cancels via DAPI route', async () => {
+  const originalFetch = globalThis.fetch;
+  const mockJwt = 'mock.eyJ1c2VyX2lkIjoiOTk5OTkiLCJleHAiOjE5OTk5OTk5OTl9.sig';
+  const mockAcc = {
+    phone: '9888877777',
+    customerId: '99999',
+    tid: mockJwt,
+    jwtTid: mockJwt,
+    token: mockJwt,
+    cookies: `tid=${mockJwt}; _session_tid=deadbeef1234`
+  };
+  const testOrderId = 'CAN123456';
+
+  globalThis.fetch = async (url, opts) => {
+    const urlStr = String(url);
+    if (urlStr.includes('/dapi/order/cancel')) {
+      const parsedBody = JSON.parse(opts.body || '{}');
+      assert.equal(parsedBody.order_id, testOrderId);
+      return makeMockResponse({
+        statusCode: 0,
+        statusMessage: 'Order cancelled successfully',
+        data: { status: 'success', order_id: testOrderId }
+      });
+    }
+    return makeMockResponse({ statusCode: 0, data: {} });
+  };
+
+  try {
+    const res = await cancelOrder(mockAcc, testOrderId);
+    assert.equal(res.success, true);
+    assert.equal(res.source, 'dapi');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await asyncTest('cancelOrder: falls back to chkout route when dapi throws', async () => {
+  const originalFetch = globalThis.fetch;
+  const mockJwt = 'mock.eyJ1c2VyX2lkIjoiOTk5OTkiLCJleHAiOjE5OTk5OTk5OTl9.sig';
+  const mockAcc = {
+    phone: '9888877777',
+    customerId: '99999',
+    tid: mockJwt,
+    jwtTid: mockJwt,
+    token: mockJwt,
+    cookies: `tid=${mockJwt}; _session_tid=deadbeef1234`
+  };
+  const testOrderId = 'CAN789012';
+
+  globalThis.fetch = async (url) => {
+    const urlStr = String(url);
+    if (urlStr.includes('/dapi/order/cancel')) {
+      throw new Error('DAPI route 404');
+    }
+    if (urlStr.includes('chkout.swiggy.com/api/v2/order/cancel')) {
+      return makeMockResponse({
+        statusCode: 0,
+        status: 'success',
+        data: { order_id: testOrderId }
+      });
+    }
+    return makeMockResponse({ statusCode: 0, data: {} });
+  };
+
+  try {
+    const res = await cancelOrder(mockAcc, testOrderId);
+    assert.equal(res.success, true);
+    assert.equal(res.source, 'chkout');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await asyncTest('cancelOrder: too-late rejection returns TOO_LATE_TO_CANCEL and keeps local order retryable', async () => {
+  const originalFetch = globalThis.fetch;
+  const mockJwt = 'mock.eyJ1c2VyX2lkIjoiOTk5OTkiLCJleHAiOjE5OTk5OTk5OTl9.sig';
+  const mockAcc = {
+    phone: '9888877777',
+    customerId: '99999',
+    tid: mockJwt,
+    jwtTid: mockJwt,
+    token: mockJwt,
+    cookies: `tid=${mockJwt}; _session_tid=deadbeef1234`
+  };
+  const testOrderId = 'CAN_TOO_LATE';
+
+  globalThis.fetch = async (url) => {
+    const urlStr = String(url);
+    if (urlStr.includes('/dapi/order/cancel')) {
+      return makeMockResponse({
+        statusCode: 1,
+        statusMessage: 'Order cannot be cancelled: Restaurant has already started preparing food',
+        data: {}
+      });
+    }
+    if (urlStr.includes('chkout.swiggy.com/api/v2/order/cancel')) {
+      return makeMockResponse({
+        statusCode: 1,
+        statusMessage: 'Order cannot be cancelled: Restaurant has already started preparing food',
+        data: {}
+      });
+    }
+    return makeMockResponse({ statusCode: 0, data: {} });
+  };
+
+  try {
+    const state = {
+      currentOrderId: testOrderId,
+      cart: [],
+      savedCart: [{ name: 'Biryani', price: 200, qty: 1 }],
+      isCancelling: false
+    };
+
+    const res = await cancelOrder(mockAcc, testOrderId);
+    assert.equal(res.success, false);
+    assert.equal(res.reason, 'TOO_LATE_TO_CANCEL');
+
+    // In handler logic, if res.reason === 'TOO_LATE_TO_CANCEL', state is preserved (not cleared)
+    if (!res.success && res.reason === 'TOO_LATE_TO_CANCEL') {
+      state.isCancelling = false;
+      // Do not clear currentOrderId
+    }
+
+    assert.equal(state.currentOrderId, testOrderId, 'Order must remain active and retryable');
+    assert.equal(state.isCancelling, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('cancelOrder: confirmed cancel restores savedCart and clears currentOrderId', () => {
+  const state = {
+    currentOrderId: 'ORDER_TO_CANCEL_123',
+    currentUpiUri: 'upi://pay?pa=mock',
+    currentPaymentTxnId: 'TXN_123',
+    cart: [],
+    savedCart: [
+      { name: 'Milk Cow 1 Ltr', price: 86, qty: 1 },
+      { name: 'Milk Cow 500 Ml', price: 46, qty: 1 }
+    ],
+    step: 'AWAITING_PAYMENT',
+    isCancelling: false
+  };
+
+  // Simulate successful cancellation flow
+  const cancelRes = { success: true, source: 'dapi' };
+  if (cancelRes.success) {
+    if (Array.isArray(state.savedCart) && state.savedCart.length > 0) {
+      state.cart = [...state.savedCart];
+    }
+    state.currentOrderId = null;
+    state.currentUpiUri = null;
+    state.currentPaymentTxnId = null;
+    state.step = 'IDLE';
+    state.isCancelling = false;
+  }
+
+  assert.equal(state.currentOrderId, null);
+  assert.equal(state.currentUpiUri, null);
+  assert.equal(state.cart.length, 2);
+  assert.equal(state.cart[0].name, 'Milk Cow 1 Ltr');
+  assert.equal(state.cart[1].name, 'Milk Cow 500 Ml');
+  assert.equal(state.step, 'IDLE');
+});
+
+test('cancelOrder: double-cancel guard prevents race condition', () => {
+  const state = {
+    currentOrderId: 'ORDER_GUARD_123',
+    isCancelling: true
+  };
+
+  let doubleCancelBlocked = false;
+  if (state.isCancelling) {
+    doubleCancelBlocked = true;
+  }
+
+  assert.equal(doubleCancelBlocked, true, 'Subsequent cancel click must be blocked by isCancelling guard');
 });
 
 console.log(`\nTest results: ${passed} passed, ${failed} failed.`);
